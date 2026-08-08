@@ -1,0 +1,34 @@
+{
+  "noteplan.minAppVersion": "3.18",
+  "macOS.minVersion": "12.0",
+  "plugin.id": "leslee.WorkActivationAssistant",
+  "plugin.name": "Work Activation Assistant",
+  "plugin.description": "Review email-derived tasks, plan selected workdays, preserve unfinished work, and update NotePlan without overwriting manual changes.",
+  "plugin.author": "Leslee Hyman",
+  "plugin.version": "0.12.0",
+  "plugin.releaseStatus": "beta",
+  "plugin.hidden": false,
+  "plugin.script": "script.js",
+  "plugin.commands": [
+    { "name": "Assistant: Dashboard", "alias": ["assistant dashboard"], "description": "Open the visual Work Activation dashboard for a workday", "jsFunction": "assistantDashboard", "arguments": ["Date (YYYY-MM-DD)"] },
+    { "name": "Assistant: Refresh Gmail & Calendar", "alias": ["assistant refresh"], "description": "Check Gmail and Calendar now, then rebuild the dashboard", "jsFunction": "assistantRefreshDashboard", "arguments": ["Date (YYYY-MM-DD)"] },
+    { "name": "Assistant: Scan Older Email", "alias": ["assistant backlog"], "description": "Review the next bounded batch of older work email", "jsFunction": "assistantScanOlderEmail" },
+    { "name": "Assistant: Build Time Blocks", "alias": ["assistant blocks"], "description": "Add suggested focus blocks around the selected date's calendar", "jsFunction": "assistantBuildTimeBlocks", "arguments": ["Date (YYYY-MM-DD)"] },
+    { "name": "Assistant: Schedule Tasks", "alias": ["assistant schedule"], "description": "Give scheduled tasks an activation date", "jsFunction": "assistantScheduleTasks" },
+    { "name": "Assistant: Review Waiting", "alias": ["assistant waiting"], "description": "Review dependencies and set follow-up dates", "jsFunction": "assistantReviewWaiting" },
+    { "name": "Assistant: Today", "alias": ["assistant today"], "description": "Refresh the assistant section for a selected date", "jsFunction": "assistantToday", "arguments": ["Date (YYYY-MM-DD)"] },
+    { "name": "Assistant: Review Email Tasks", "alias": ["assistant review"], "description": "Review Gmail task suggestions", "jsFunction": "assistantReview" },
+    { "name": "Assistant: Capture Idea", "alias": ["assistant idea"], "description": "Capture an idea and answer one follow-up", "jsFunction": "assistantIdea" },
+    { "name": "Assistant: Check In", "alias": ["assistant check-in"], "description": "Answer today's short check-in", "jsFunction": "assistantCheckIn" },
+    { "name": "Assistant: Pause", "alias": ["assistant pause"], "description": "Pause or resume scheduled delivery", "jsFunction": "assistantPause" },
+    { "name": "Assistant: Reconnect Google", "alias": ["assistant reconnect"], "description": "Reconnect Gmail and Calendar authorization", "jsFunction": "assistantReconnect" },
+    { "name": "Assistant: Import Pilot Review", "alias": ["assistant import"], "description": "Import the completed browser pilot into NotePlan", "jsFunction": "assistantImportPilotReview", "arguments": ["Encoded pilot review"] },
+    { "name": "Assistant: Reset Today", "alias": ["assistant reset"], "description": "Rebuild only the assistant-managed section", "jsFunction": "assistantReset" },
+    { "name": "onMessageFromHTMLView", "description": "Receive dashboard edits", "jsFunction": "onMessageFromHTMLView", "hidden": true }
+  ],
+  "plugin.settings": [
+    { "type": "heading", "title": "Work Activation Assistant" },
+    { "key": "serviceUrl", "type": "string", "title": "Service URL", "description": "Cloud Run URL without a trailing slash; leave empty during local pilot", "default": "", "required": false },
+    { "key": "apiToken", "type": "string", "title": "Service API token", "description": "Private token generated during deployment; leave empty during local pilot", "default": "", "required": false }
+  ]
+}

@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.env
+prototype
+pilot
+noteplan-plugin
+test
+*.png
