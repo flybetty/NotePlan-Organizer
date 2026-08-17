@@ -103,7 +103,7 @@ test("Ignore saves directly, removes the card, and remains absent after refresh"
   const ignored = task("email-ignore", "Ignore this item");
   const calls = [];
   const first = renderDashboard(plan({ review: [ignored] }), { fetch: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200 }; } });
-  assert.match(first.document.querySelector(".statuses").textContent, /assistant · v0\.19\.1/);
+  assert.match(first.document.querySelector(".statuses").textContent, /assistant · v0\.20\.0/);
   assert.ok([...first.document.querySelectorAll("a")].some((link) => link.textContent === "Run System Check"));
   const button = [...first.document.querySelectorAll(".direct-review")].find((item) => item.textContent === "Ignore");
   button.click();

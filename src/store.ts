@@ -1,6 +1,5 @@
-import { Firestore } from "@google-cloud/firestore";
 import { createHash } from "node:crypto";
-import { applyReviewDecision, applyTaskUpdate, removeSuggestionFromPlan, type DailyPlan, type GmailBacklogState, type GmailSyncState, type ProjectStatus, type ReviewDecision, type ReviewDetails, type SourceHealth, type TaskSuggestion, type TaskUpdate } from "./domain.js";
+import { applyReviewDecision, applyTaskUpdate, removeSuggestionFromPlan, taskObligationKey, type DailyPlan, type GmailBacklogState, type GmailSyncState, type ProjectStatus, type ReviewDecision, type ReviewDetails, type SourceHealth, type TaskSuggestion, type TaskUpdate } from "./domain.js";
 
 function projectId(name: string): string {
   return createHash("sha256").update(name.trim().toLowerCase()).digest("hex").slice(0, 24);
@@ -37,11 +36,7 @@ export interface AssistantStore {
 }
 
 export class FirestoreAssistantStore implements AssistantStore {
-  private readonly firestore: Firestore;
-
-  constructor(projectId: string) {
-    this.firestore = new Firestore({ projectId });
-  }
+  constructor(private readonly firestore: any) {}
 
   async upsertSuggestions(tasks: TaskSuggestion[]): Promise<void> {
     if (!tasks.length) return;
@@ -71,9 +66,11 @@ export class FirestoreAssistantStore implements AssistantStore {
   async reconcileGmailSuggestions(threadIds: string[], tasks: TaskSuggestion[]): Promise<void> {
     const processed = new Set(threadIds);
     const existing = await this.firestore.collection("taskSuggestions").get();
-    const existingTasks = existing.docs.map((document) => document.data() as TaskSuggestion);
-    const ignoredSourceIds = new Set(existingTasks.filter((task) => task.sourceType === "gmail" && task.status === "ignored").map((task) => task.sourceId));
-    const returnedResponses = new Map(existingTasks.filter((task) => task.sourceType === "gmail" && task.returnedFromWaiting && task.waitingResponseReceivedAt).map((task) => [task.sourceId, task.waitingResponseReceivedAt!]));
+    const existingTasks: TaskSuggestion[] = existing.docs.map((document: any) => document.data() as TaskSuggestion);
+    const terminalTasks = existingTasks.filter((task) => task.sourceType === "gmail" && (task.status === "ignored" || task.status === "done"));
+    const terminalBySource = new Map<string, TaskSuggestion>(terminalTasks.map((task) => [task.sourceId, task]));
+    const terminalByObligation = new Map<string, TaskSuggestion>(terminalTasks.map((task) => [taskObligationKey(task), task]));
+    const returnedResponses = new Map<string, string>(existingTasks.filter((task) => task.sourceType === "gmail" && task.returnedFromWaiting && task.waitingResponseReceivedAt).map((task) => [task.sourceId, task.waitingResponseReceivedAt!]));
     const reviewedActivity = new Map<string, string | null>();
     for (const task of existingTasks.filter((item) => item.sourceType === "gmail" && item.status !== "review" && item.reviewedAt)) {
       const activity = task.emailLastActivityAt ?? null;
@@ -82,7 +79,8 @@ export class FirestoreAssistantStore implements AssistantStore {
     }
     const accepted = tasks.filter((task) => {
       if (task.sourceType !== "gmail") return true;
-      if (ignoredSourceIds.has(task.sourceId)) return false;
+      const terminal = terminalBySource.get(task.sourceId) || terminalByObligation.get(taskObligationKey(task));
+      if (terminal && (!task.emailLastActivityAt || !terminal.reviewedAt || task.emailLastActivityAt <= terminal.reviewedAt)) return false;
       const returnedAt = returnedResponses.get(task.sourceId);
       if (returnedAt && task.emailReceivedAt && task.emailReceivedAt <= returnedAt) return false;
       const reviewedAtActivity = reviewedActivity.get(task.sourceId);
@@ -124,7 +122,7 @@ export class FirestoreAssistantStore implements AssistantStore {
 
   async listSuggestions(): Promise<TaskSuggestion[]> {
     const snapshot = await this.firestore.collection("taskSuggestions").get();
-    return snapshot.docs.map((document) => document.data() as TaskSuggestion);
+    return snapshot.docs.map((document: any) => document.data() as TaskSuggestion);
   }
 
   async getSuggestion(id: string): Promise<TaskSuggestion | null> {
@@ -134,7 +132,7 @@ export class FirestoreAssistantStore implements AssistantStore {
 
   async reviewSuggestion(id: string, decision: ReviewDecision, details: ReviewDetails, reviewedAt: string): Promise<TaskSuggestion> {
     const reference = this.firestore.collection("taskSuggestions").doc(id);
-    return this.firestore.runTransaction(async (transaction) => {
+    return this.firestore.runTransaction(async (transaction: any) => {
       const snapshot = await transaction.get(reference);
       if (!snapshot.exists) throw new Error(`Unknown task suggestion: ${id}`);
       const updated = applyReviewDecision(snapshot.data() as TaskSuggestion, decision, details, reviewedAt);
@@ -164,7 +162,7 @@ export class FirestoreAssistantStore implements AssistantStore {
 
   async updateTask(id: string, update: TaskUpdate, updatedAt: string): Promise<TaskSuggestion> {
     const reference = this.firestore.collection("taskSuggestions").doc(id);
-    return this.firestore.runTransaction(async (transaction) => {
+    return this.firestore.runTransaction(async (transaction: any) => {
       const snapshot = await transaction.get(reference);
       if (!snapshot.exists) throw new Error(`Unknown task suggestion: ${id}`);
       const updated = applyTaskUpdate(snapshot.data() as TaskSuggestion, update, updatedAt);
@@ -175,7 +173,7 @@ export class FirestoreAssistantStore implements AssistantStore {
 
   async listProjectStatuses(): Promise<Map<string, ProjectStatus>> {
     const snapshot = await this.firestore.collection("projectStatuses").get();
-    return new Map(snapshot.docs.map((document) => [String(document.data().name), document.data().status as ProjectStatus]));
+    return new Map(snapshot.docs.map((document: any) => [String(document.data().name), document.data().status as ProjectStatus]));
   }
 
   async setProjectStatus(name: string, status: ProjectStatus, updatedAt: string): Promise<void> {
@@ -188,7 +186,7 @@ export class FirestoreAssistantStore implements AssistantStore {
 
   async listSourceHealth(): Promise<SourceHealth[]> {
     const snapshot = await this.firestore.collection("sourceHealth").get();
-    return snapshot.docs.map((document) => document.data() as SourceHealth);
+    return snapshot.docs.map((document: any) => document.data() as SourceHealth);
   }
 
   async savePlan(plan: DailyPlan): Promise<void> {
@@ -207,7 +205,7 @@ export class FirestoreAssistantStore implements AssistantStore {
 
   async addIdeaAnswer(id: string, answer: string, createdAt: string): Promise<number> {
     const reference = this.firestore.collection("ideas").doc(id);
-    return this.firestore.runTransaction(async (transaction) => {
+    return this.firestore.runTransaction(async (transaction: any) => {
       const snapshot = await transaction.get(reference);
       if (!snapshot.exists) throw new Error(`Unknown idea: ${id}`);
       const answers = [...(snapshot.data()?.answers ?? []), { answer, createdAt }];
@@ -218,7 +216,7 @@ export class FirestoreAssistantStore implements AssistantStore {
 
   async listIdeas(): Promise<Array<{ id: string; text: string; answers: Array<{ answer: string; createdAt: string }> }>> {
     const snapshot = await this.firestore.collection("ideas").orderBy("createdAt", "desc").limit(50).get();
-    return snapshot.docs.map((document) => ({ id: document.id, text: String(document.data().text || ""), answers: document.data().answers || [] }));
+    return snapshot.docs.map((document: any) => ({ id: document.id, text: String(document.data().text || ""), answers: document.data().answers || [] }));
   }
 
   async saveCheckIn(question: string, answer: string, createdAt: string): Promise<void> {
@@ -227,7 +225,7 @@ export class FirestoreAssistantStore implements AssistantStore {
 
   async listCheckIns(): Promise<Array<{ question: string; answer: string; createdAt: string }>> {
     const snapshot = await this.firestore.collection("checkIns").orderBy("createdAt", "desc").limit(50).get();
-    return snapshot.docs.map((document) => document.data() as { question: string; answer: string; createdAt: string });
+    return snapshot.docs.map((document: any) => document.data() as { question: string; answer: string; createdAt: string });
   }
 
   async setPaused(paused: boolean): Promise<void> {
@@ -295,7 +293,9 @@ export class MemoryAssistantStore implements AssistantStore {
   async reconcileGmailSuggestions(threadIds: string[], tasks: TaskSuggestion[]): Promise<void> {
     const processed = new Set(threadIds);
     const existingTasks = [...this.tasks.values()];
-    const ignoredSourceIds = new Set(existingTasks.filter((task) => task.sourceType === "gmail" && task.status === "ignored").map((task) => task.sourceId));
+    const terminalTasks = existingTasks.filter((task) => task.sourceType === "gmail" && (task.status === "ignored" || task.status === "done"));
+    const terminalBySource = new Map(terminalTasks.map((task) => [task.sourceId, task]));
+    const terminalByObligation = new Map(terminalTasks.map((task) => [taskObligationKey(task), task]));
     const returnedResponses = new Map(existingTasks.filter((task) => task.sourceType === "gmail" && task.returnedFromWaiting && task.waitingResponseReceivedAt).map((task) => [task.sourceId, task.waitingResponseReceivedAt!]));
     const reviewedActivity = new Map<string, string | null>();
     for (const task of existingTasks.filter((item) => item.sourceType === "gmail" && item.status !== "review" && item.reviewedAt)) {
@@ -305,7 +305,8 @@ export class MemoryAssistantStore implements AssistantStore {
     }
     const accepted = tasks.filter((task) => {
       if (task.sourceType !== "gmail") return true;
-      if (ignoredSourceIds.has(task.sourceId)) return false;
+      const terminal = terminalBySource.get(task.sourceId) || terminalByObligation.get(taskObligationKey(task));
+      if (terminal && (!task.emailLastActivityAt || !terminal.reviewedAt || task.emailLastActivityAt <= terminal.reviewedAt)) return false;
       const returnedAt = returnedResponses.get(task.sourceId);
       if (returnedAt && task.emailReceivedAt && task.emailReceivedAt <= returnedAt) return false;
       const reviewedAtActivity = reviewedActivity.get(task.sourceId);

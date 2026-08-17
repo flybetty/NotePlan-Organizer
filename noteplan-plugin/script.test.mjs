@@ -48,6 +48,76 @@ test("date navigation skips weekends in both directions", () => {
   assert.equal(run('moveWorkday("2026-08-10", -1)'), "2026-08-07");
 });
 
+test("native task parser accepts NotePlan scheduling suffixes", () => {
+  const { run } = pluginContext();
+  const details = run(`nativeTaskDetails("* [x] 10:00 AM - 11:00 AM Finish invoice [email](https://mail.google.com/thread) #assistant/work ^w7wdpv >2026-08-17")`);
+  assert.equal(details.blockId, "w7wdpv");
+  assert.equal(details.title, "Finish invoice");
+  assert.equal(details.start, 600);
+  assert.equal(details.end, 660);
+  assert.equal(details.completed, true);
+  assert.equal(details.scheduledDate, "2026-08-17");
+});
+
+test("native NotePlan date links define the effective scheduled workday", () => {
+  const environment = pluginContext();
+  addDailyNote(environment, "2026-08-14", "## Work Activation Tasks\n* 10:00 AM - 11:00 AM Monday work #assistant/work ^wmonda >2026-08-17");
+  environment.json.set("native-task-index.json", { version: 1, tasks: { monday: { blockId: "wmonda", date: "2026-08-14", title: "Monday work", status: "scheduled", done: false } } });
+  environment.context.collections = environment.run(`nativeTaskCollections("2026-08-17")`);
+  assert.equal(environment.context.collections.focusBlocks.length, 1);
+  assert.equal(environment.context.collections.focusBlocks[0].task.title, "Monday work");
+});
+
+test("native collections are authoritative over stale cloud active lists", () => {
+  const environment = pluginContext();
+  addDailyNote(environment, "2026-08-17", "## Work Activation Tasks\n* Native real task #assistant/work ^wnativ");
+  environment.json.set("native-task-index.json", { version: 1, tasks: { "native-task": { blockId: "wnativ", date: "2026-08-17", title: "Native real task", status: "today", done: false } } });
+  environment.context.collections = environment.run(`nativeTaskCollections("2026-08-17")`);
+  assert.deepEqual(Array.from(environment.context.collections.today, (task) => task.title), ["Native real task"]);
+  assert.equal(environment.context.collections.focusBlocks.length, 0);
+});
+
+test("terminal decisions remove ignored native tasks before dashboard rendering", () => {
+  const environment = pluginContext();
+  const note = addDailyNote(environment, "2026-08-17", "## Work Activation Tasks\n* Ignore forever #assistant/work ^wignor");
+  environment.json.set("native-task-index.json", { version: 1, tasks: { ignored: { blockId: "wignor", date: "2026-08-17", title: "Ignore forever", status: "today", done: false } } });
+  environment.context.states = [{ id: "ignored", status: "ignored", reviewDecision: "ignore" }];
+  assert.equal(environment.run("applyTerminalTaskStates(states)"), true);
+  assert.doesNotMatch(note.content, /Ignore forever/);
+  assert.equal(environment.json.get("native-task-index.json").tasks.ignored, undefined);
+});
+
+test("cached review cards are filtered by durable terminal decisions", () => {
+  const { run, context } = pluginContext();
+  context.plan = { review: [{ id: "duplicate", sourceId: "old-thread", actionKey: "follow up", title: "Please follow up with James", project: "Sparky's", emailLastActivityAt: "2026-08-06T15:00:00Z" }], waiting: [] };
+  context.states = [{ id: "ignored", sourceId: "other-thread", actionKey: "follow-up", title: "Follow up with James", project: "Sparky's", status: "ignored", reviewDecision: "ignore", reviewedAt: "2026-08-07T16:00:00Z" }];
+  const filtered = run("filterPlanByTaskStates(plan, states)");
+  assert.equal(filtered.review.length, 0);
+});
+
+test("duplicate native placements collapse to the latest one", () => {
+  const environment = pluginContext();
+  const friday = addDailyNote(environment, "2026-08-14", "## Work Activation Tasks\n* Old copy #assistant/work ^wdupli");
+  const monday = addDailyNote(environment, "2026-08-17", "## Work Activation Tasks\n* Current copy #assistant/work ^wdupli");
+  environment.json.set("native-task-index.json", { version: 1, tasks: { duplicate: { blockId: "wdupli", date: "2026-08-14", title: "Old copy", status: "today", done: false } } });
+  assert.equal(environment.run("deduplicateNativeTaskOccurrences()"), 1);
+  assert.doesNotMatch(friday.content, /Old copy/);
+  assert.match(monday.content, /Current copy/);
+  assert.equal(environment.json.get("native-task-index.json").tasks.duplicate.date, "2026-08-17");
+});
+
+test("old review email is collapsed into a separate backlog", () => {
+  const { run, context } = pluginContext();
+  context.items = [
+    { id: "new", title: "New action", emailReceivedAt: "2026-08-16T15:00:00Z" },
+    { id: "old", title: "Old action", emailReceivedAt: "2026-06-01T15:00:00Z" },
+  ];
+  const html = run('reviewDashboardSection(items, "2026-08-17")');
+  assert.match(html, /Email Task Review/);
+  assert.match(html, /Older Email Backlog · 1/);
+  assert.match(html, /<details class="email-backlog">/);
+});
+
 test("selected dates use the correct planning window", () => {
   const { run } = pluginContext();
   const today = run("localDate()");
@@ -112,7 +182,7 @@ test("Next Workday opens from verified saved state when that date has no generat
       if (url.endsWith("/api/projects")) return JSON.stringify({ projects: [] });
       if (url.includes("/api/today")) {
         const date = new URL(url).searchParams.get("date");
-        if (date === "2026-08-14") return "null";
+        if (date === "2026-08-18") return "null";
         return JSON.stringify({ date, generatedAt: "2026-08-13T15:00:00Z", sources: [{ source: "gmail", status: "connected", checkedAt: "2026-08-13T15:00:00Z" }], warnings: [], startHere: null, review: [], today: [], waiting: [], scheduled: [], other: [], projects: [], calendar: [], emailCoverage: { complete: true, scannedThreads: 10, lastScanAt: "2026-08-13T15:00:00Z" } });
       }
       throw new Error(`Unexpected request: ${url}`);
@@ -121,11 +191,11 @@ test("Next Workday opens from verified saved state when that date has no generat
     CommandBar: { prompt: async (...args) => prompts.push(args), showInput: async () => null },
     HTMLView: { showWindowWithOptions: (html) => shown.push(html) },
   });
-  await environment.run("assistantViewWorkday('2026-08-14')");
-  assert.ok(calls.some((url) => url.includes("/api/today?date=2026-08-14")));
-  assert.ok(calls.some((url) => url.includes("/api/today?date=2026-08-13")));
+  await environment.run("assistantViewWorkday('2026-08-18')");
+  assert.ok(calls.some((url) => url.includes("/api/today?date=2026-08-18")));
+  assert.ok(calls.some((url) => url.includes("/api/today?date=2026-08-17")));
   assert.equal(shown.length, 1);
-  assert.match(shown[0], /Friday, August 14/);
+  assert.match(shown[0], /Tuesday, August 18/);
   assert.match(shown[0], /No cloud report was generated/);
   assert.equal(prompts.length, 0);
 });
@@ -187,15 +257,16 @@ test("waiting items render together without invented follow-up dates", () => {
 });
 
 test("returned waiting reply is automatically placed in the next open native block", async () => {
-  const returned = { id: "returned-waiting", title: "Finish website after reply", project: "Client", status: "scheduled", scheduledFor: "2026-08-14", returnedFromWaiting: true, waitingOn: "James", waitingResponseReceivedAt: "2026-08-13T18:00:00Z" };
+  const targetDate = "2026-08-18";
+  const returned = { id: "returned-waiting", title: "Finish website after reply", project: "Client", status: "scheduled", scheduledFor: targetDate, returnedFromWaiting: true, waitingOn: "James", waitingResponseReceivedAt: "2026-08-17T18:00:00Z" };
   const environment = pluginContext({ fetch: async (url) => {
     if (url.endsWith("/api/projects")) return JSON.stringify({ projects: [] });
-    if (url.includes("/api/today")) return JSON.stringify({ date: "2026-08-14", generatedAt: "2026-08-13T18:00:00Z", sources: [], warnings: [], startHere: returned, review: [], today: [returned], waiting: [], scheduled: [], other: [], projects: [], calendar: [], emailCoverage: { complete: true, scannedThreads: 1, lastScanAt: null } });
+    if (url.includes("/api/today")) return JSON.stringify({ date: targetDate, generatedAt: "2026-08-17T18:00:00Z", sources: [], warnings: [], startHere: returned, review: [], today: [returned], waiting: [], scheduled: [], other: [], projects: [], calendar: [], emailCoverage: { complete: true, scannedThreads: 1, lastScanAt: null } });
     throw new Error(`Unexpected request: ${url}`);
   } });
   environment.context.DataStore.settings = { serviceUrl: "https://service.example.com", apiToken: "private-token" };
-  const note = addDailyNote(environment, "2026-08-14");
-  environment.context.returnedPlan = await environment.run('currentPlan("2026-08-14")');
+  const note = addDailyNote(environment, targetDate);
+  environment.context.returnedPlan = await environment.run(`currentPlan("${targetDate}")`);
   assert.match(note.content, /^\* 9:00 AM - 9:30 AM ↩ Finish website after reply/m);
   assert.equal(environment.context.returnedPlan.today.length, 0);
   assert.equal(environment.context.returnedPlan.focusBlocks[0].returnedFromWaiting, true);
@@ -851,7 +922,7 @@ test("system check reports loaded version, connection, review IDs, and native bl
   });
   environment.context.DataStore.settings = { serviceUrl: "https://service.example.com", apiToken: "private-token" };
   await environment.run("assistantSystemCheck()");
-  assert.match(prompts[0].message, /Plugin 0\.19\.1 is loaded/);
+  assert.match(prompts[0].message, /Plugin 0\.20\.0 is loaded/);
   assert.match(prompts[0].message, /Gmail and Calendar connection is available/);
   assert.match(prompts[0].message, /2 review items have unique IDs/);
   assert.match(prompts[0].message, /native tasks have unique blocks/);

@@ -1,7 +1,6 @@
-import { SecretManagerServiceClient } from "@google-cloud/secret-manager";
-import { google, type gmail_v1 } from "googleapis";
-import type { Credentials } from "google-auth-library";
+import { OAuth2Client, type Credentials } from "google-auth-library";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { createRequire } from "node:module";
 import type { AppConfig } from "./config.js";
 import type { CalendarCommitment, EmailThreadInput, GmailBacklogResult, GmailReadResult, GmailSyncState, ReviewDecision } from "./domain.js";
 
@@ -10,6 +9,19 @@ const THREAD_MESSAGE_LIMIT = 6;
 const THREAD_CHARACTER_LIMIT = 24_000;
 const BACKLOG_THREAD_LIMIT = 25;
 const offsetFormatterByTimeZone = new Map<string, Intl.DateTimeFormat>();
+const runtimeRequire = createRequire(import.meta.url);
+type GoogleSdkClient = any;
+type GmailMessage = any;
+
+function gmailClient(auth: OAuth2Client): GoogleSdkClient {
+  const { gmail } = runtimeRequire("googleapis/build/src/apis/gmail");
+  return gmail({ version: "v1", auth });
+}
+
+function calendarClient(auth: OAuth2Client): GoogleSdkClient {
+  const { calendar } = runtimeRequire("googleapis/build/src/apis/calendar");
+  return calendar({ version: "v3", auth });
+}
 
 export class ReconnectRequiredError extends Error {
   constructor(message = "Google authorization must be renewed") {
@@ -30,7 +42,7 @@ export interface GoogleDataGateway {
 }
 
 class GoogleTokenStore {
-  private readonly client = new SecretManagerServiceClient();
+  private clientPromise: Promise<GoogleSdkClient> | null = null;
 
   constructor(private readonly projectId: string, private readonly secretId: string) {}
 
@@ -38,9 +50,17 @@ class GoogleTokenStore {
     return `projects/${this.projectId}/secrets/${this.secretId}`;
   }
 
+  private client(): Promise<GoogleSdkClient> {
+    if (!this.clientPromise) this.clientPromise = Promise.resolve().then(() => {
+      const { SecretManagerServiceClient } = runtimeRequire("@google-cloud/secret-manager");
+      return new SecretManagerServiceClient();
+    });
+    return this.clientPromise;
+  }
+
   async read(): Promise<Credentials | null> {
     try {
-      const [version] = await this.client.accessSecretVersion({ name: `${this.parent}/versions/latest` });
+      const [version] = await (await this.client()).accessSecretVersion({ name: `${this.parent}/versions/latest` });
       const value = version.payload?.data?.toString();
       return value ? JSON.parse(value) as Credentials : null;
     } catch (error) {
@@ -51,7 +71,7 @@ class GoogleTokenStore {
   }
 
   async write(credentials: Credentials): Promise<void> {
-    await this.client.addSecretVersion({ parent: this.parent, payload: { data: Buffer.from(JSON.stringify(credentials)) } });
+    await (await this.client()).addSecretVersion({ parent: this.parent, payload: { data: Buffer.from(JSON.stringify(credentials)) } });
   }
 }
 
@@ -116,9 +136,9 @@ export function utcDayRangeForTimeZone(date: string, timeZone: string): { startI
   return { startIso: start.toISOString(), endIso: end.toISOString() };
 }
 
-function decodeBody(message: gmail_v1.Schema$Message): string {
+function decodeBody(message: GmailMessage): string {
   const decode = (value?: string | null) => value ? Buffer.from(value.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8") : "";
-  const walk = (part?: gmail_v1.Schema$MessagePart): string => {
+  const walk = (part?: any): string => {
     if (!part) return "";
     if (part.mimeType === "text/plain" && part.body?.data) return decode(part.body.data);
     return (part.parts ?? []).map(walk).filter(Boolean).join("\n");
@@ -133,8 +153,8 @@ export function redactSecrets(content: string): string {
     .slice(0, 12_000);
 }
 
-function header(message: gmail_v1.Schema$Message, name: string): string {
-  return message.payload?.headers?.find((item) => item.name?.toLowerCase() === name.toLowerCase())?.value ?? "";
+function header(message: GmailMessage, name: string): string {
+  return message.payload?.headers?.find((item: any) => item.name?.toLowerCase() === name.toLowerCase())?.value ?? "";
 }
 
 export function isAssistantDigest(subject: string, from: string, to: string, ownerAccount: string): boolean {
@@ -142,7 +162,7 @@ export function isAssistantDigest(subject: string, from: string, to: string, own
   return /^work plan\b/i.test(subject.trim()) && from.toLowerCase().includes(owner) && to.toLowerCase().includes(owner);
 }
 
-export function isSpamThread(messages: gmail_v1.Schema$Message[]): boolean {
+export function isSpamThread(messages: GmailMessage[]): boolean {
   return messages.some((message) => (message.labelIds ?? []).includes("SPAM"));
 }
 
@@ -154,7 +174,7 @@ export class GoogleApiGateway implements GoogleDataGateway {
   }
 
   private oauth() {
-    return new google.auth.OAuth2(this.config.GOOGLE_CLIENT_ID, this.config.GOOGLE_CLIENT_SECRET, this.config.GOOGLE_REDIRECT_URI);
+    return new OAuth2Client(this.config.GOOGLE_CLIENT_ID, this.config.GOOGLE_CLIENT_SECRET, this.config.GOOGLE_REDIRECT_URI);
   }
 
   authorizationUrl(): string {
@@ -211,7 +231,7 @@ export class GoogleApiGateway implements GoogleDataGateway {
     }
   }
 
-  private async initialThreadIds(gmail: gmail_v1.Gmail): Promise<Set<string>> {
+  private async initialThreadIds(gmail: GoogleSdkClient): Promise<Set<string>> {
     const queries = [
       "newer_than:30d in:inbox -in:spam -category:promotions -category:social -category:forums -label:Assistant/Reviewed",
       "newer_than:90d in:sent -in:spam -label:Assistant/Reviewed",
@@ -224,7 +244,7 @@ export class GoogleApiGateway implements GoogleDataGateway {
     return threadIds;
   }
 
-  private async incrementalThreadIds(gmail: gmail_v1.Gmail, startHistoryId: string): Promise<{ threadIds: Set<string>; historyId: string }> {
+  private async incrementalThreadIds(gmail: GoogleSdkClient, startHistoryId: string): Promise<{ threadIds: Set<string>; historyId: string }> {
     const threadIds = new Set<string>();
     let historyId = startHistoryId;
     let pageToken: string | undefined;
@@ -242,7 +262,7 @@ export class GoogleApiGateway implements GoogleDataGateway {
     return { threadIds, historyId };
   }
 
-  private async fetchThreads(gmail: gmail_v1.Gmail, threadIds: Set<string>): Promise<EmailThreadInput[]> {
+  private async fetchThreads(gmail: GoogleSdkClient, threadIds: Set<string>): Promise<EmailThreadInput[]> {
     const threads: EmailThreadInput[] = [];
     const ids = [...threadIds];
     for (let index = 0; index < ids.length; index += 10) {
@@ -259,7 +279,7 @@ export class GoogleApiGateway implements GoogleDataGateway {
         const latestReceived = [...messages].reverse().find((message) => !header(message, "From").toLowerCase().includes(ownerAccount));
         const content = messages
           .slice(-THREAD_MESSAGE_LIMIT)
-          .map((message) => {
+          .map((message: GmailMessage) => {
             const from = header(message, "From");
             const to = header(message, "To");
             const sentAt = new Date(Number(message.internalDate ?? Date.now())).toISOString();
@@ -286,36 +306,36 @@ export class GoogleApiGateway implements GoogleDataGateway {
 
   async readRecentThreads(state: GmailSyncState | null): Promise<GmailReadResult> {
     const auth = await this.authorizedClient();
-    const gmail = google.gmail({ version: "v1", auth });
+    const gmailApi = gmailClient(auth);
     if (state?.historyId) {
       try {
-        const incremental = await this.incrementalThreadIds(gmail, state.historyId);
-        return { threads: await this.fetchThreads(gmail, incremental.threadIds), historyId: incremental.historyId, mode: "incremental" };
+        const incremental = await this.incrementalThreadIds(gmailApi, state.historyId);
+        return { threads: await this.fetchThreads(gmailApi, incremental.threadIds), historyId: incremental.historyId, mode: "incremental" };
       } catch (error) {
         if ((error as { code?: number }).code !== 404) throw error;
-        const profile = await gmail.users.getProfile({ userId: "me" });
+        const profile = await gmailApi.users.getProfile({ userId: "me" });
         const historyId = profile.data.historyId;
         if (!historyId) throw new Error("Gmail did not return a mailbox history ID");
-        return { threads: await this.fetchThreads(gmail, await this.initialThreadIds(gmail)), historyId, mode: "fallback" };
+        return { threads: await this.fetchThreads(gmailApi, await this.initialThreadIds(gmailApi)), historyId, mode: "fallback" };
       }
     }
-    const profile = await gmail.users.getProfile({ userId: "me" });
+    const profile = await gmailApi.users.getProfile({ userId: "me" });
     const historyId = profile.data.historyId;
     if (!historyId) throw new Error("Gmail did not return a mailbox history ID");
-    return { threads: await this.fetchThreads(gmail, await this.initialThreadIds(gmail)), historyId, mode: "initial" };
+    return { threads: await this.fetchThreads(gmailApi, await this.initialThreadIds(gmailApi)), historyId, mode: "initial" };
   }
 
   async readBacklogThreads(beforeEpoch: number | null): Promise<GmailBacklogResult> {
     const auth = await this.authorizedClient();
-    const gmail = google.gmail({ version: "v1", auth });
+    const gmailApi = gmailClient(auth);
     const nowEpoch = Math.floor(Date.now() / 1000);
     const upperBound = beforeEpoch ?? nowEpoch;
     const lowerBound = nowEpoch - 365 * 24 * 60 * 60;
     if (upperBound <= lowerBound) return { threads: [], nextBeforeEpoch: lowerBound, complete: true };
     const query = `{in:inbox in:sent} after:${lowerBound} before:${upperBound} -in:spam -category:promotions -category:social -category:forums -label:Assistant/Reviewed`;
-    const response = await gmail.users.threads.list({ userId: "me", q: query, maxResults: BACKLOG_THREAD_LIMIT });
-    const threadIds = new Set((response.data.threads ?? []).map((thread) => thread.id).filter((id): id is string => Boolean(id)));
-    const threads = await this.fetchThreads(gmail, threadIds);
+    const response = await gmailApi.users.threads.list({ userId: "me", q: query, maxResults: BACKLOG_THREAD_LIMIT });
+    const threadIds = new Set<string>((response.data.threads ?? []).map((thread: any) => thread.id).filter((id: unknown): id is string => typeof id === "string" && Boolean(id)));
+    const threads = await this.fetchThreads(gmailApi, threadIds);
     const oldestEpoch = threads.length ? Math.min(...threads.map((thread) => Math.floor(new Date(thread.latestAt).getTime() / 1000))) - 1 : lowerBound;
     return {
       threads,
@@ -326,17 +346,17 @@ export class GoogleApiGateway implements GoogleDataGateway {
 
   async readThreadsByIds(threadIds: string[]): Promise<EmailThreadInput[]> {
     const auth = await this.authorizedClient();
-    const gmail = google.gmail({ version: "v1", auth });
-    return this.fetchThreads(gmail, new Set(threadIds));
+    const gmailApi = gmailClient(auth);
+    return this.fetchThreads(gmailApi, new Set(threadIds));
   }
 
   async readCalendar(date: string): Promise<CalendarCommitment[]> {
     const auth = await this.authorizedClient();
-    const calendar = google.calendar({ version: "v3", auth });
+    const calendarApi = calendarClient(auth);
     const range = utcDayRangeForTimeZone(date, this.config.TIME_ZONE);
     const commitments: CalendarCommitment[] = [];
     for (const calendarId of this.config.calendarIds) {
-      const response = await calendar.events.list({
+      const response = await calendarApi.events.list({
         calendarId,
         timeMin: range.startIso,
         timeMax: range.endIso,
@@ -362,20 +382,20 @@ export class GoogleApiGateway implements GoogleDataGateway {
 
   async applyReviewLabels(threadId: string, decision: ReviewDecision): Promise<void> {
     const auth = await this.authorizedClient();
-    const gmail = google.gmail({ version: "v1", auth });
-    const existing = await gmail.users.labels.list({ userId: "me" });
-    const labels = new Map((existing.data.labels ?? []).map((label) => [label.name, label.id]));
+    const gmailApi = gmailClient(auth);
+    const existing = await gmailApi.users.labels.list({ userId: "me" });
+    const labels = new Map<string, string>((existing.data.labels ?? []).flatMap((label: any) => label.name && label.id ? [[String(label.name), String(label.id)]] : []));
     const ensureLabel = async (name: string): Promise<string> => {
       const known = labels.get(name);
       if (known) return known;
-      const created = await gmail.users.labels.create({ userId: "me", requestBody: { name, labelListVisibility: "labelShowIfUnread", messageListVisibility: "show" } });
+      const created = await gmailApi.users.labels.create({ userId: "me", requestBody: { name, labelListVisibility: "labelShowIfUnread", messageListVisibility: "show" } });
       if (!created.data.id) throw new Error(`Could not create Gmail label ${name}`);
       labels.set(name, created.data.id);
       return created.data.id;
     };
     const names = decision === "waiting" ? ["Assistant/Waiting", "Assistant/Reviewed"] : ["complete", "ignore"].includes(decision) ? ["Assistant/Reviewed"] : ["Assistant/Action", "Assistant/Reviewed"];
     const addLabelIds = await Promise.all(names.map(ensureLabel));
-    await gmail.users.threads.modify({ userId: "me", id: threadId, requestBody: { addLabelIds } });
+    await gmailApi.users.threads.modify({ userId: "me", id: threadId, requestBody: { addLabelIds } });
   }
 
 }

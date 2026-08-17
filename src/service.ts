@@ -1,7 +1,7 @@
 import type { AppConfig } from "./config.js";
 import type { EmailClassifier } from "./classifier.js";
 import { createHash } from "node:crypto";
-import { calculateCapacity, checkInForDate, nextIdeaQuestion, selectStartHere, type CalendarCommitment, type DailyPlan, type ProjectStatus, type ProjectSummary, type ReviewDecision, type ReviewDetails, type SourceHealth, type TaskSuggestion, type TaskUpdate } from "./domain.js";
+import { calculateCapacity, checkInForDate, nextIdeaQuestion, selectStartHere, taskObligationKey, type CalendarCommitment, type DailyPlan, type ProjectStatus, type ProjectSummary, type ReviewDecision, type ReviewDetails, type SourceHealth, type TaskDecisionState, type TaskSuggestion, type TaskUpdate } from "./domain.js";
 import type { GoogleDataGateway } from "./google.js";
 import { ReconnectRequiredError } from "./google.js";
 import type { AssistantStore } from "./store.js";
@@ -15,6 +15,7 @@ function summarizeProjects(tasks: TaskSuggestion[], statuses: Map<string, Projec
     if (!task.project || ["ignored", "done"].includes(task.status)) continue;
     counts.set(task.project, (counts.get(task.project) ?? 0) + 1);
   }
+  for (const name of statuses.keys()) if (!counts.has(name)) counts.set(name, 0);
   const summaries: ProjectSummary[] = [...counts.entries()].map(([name, openTaskCount]) => ({
     id: createHash("sha256").update(name.trim().toLowerCase()).digest("hex").slice(0, 24),
     name,
@@ -187,6 +188,23 @@ export class WorkAssistantService {
     return this.store.getPlan(date);
   }
 
+  async taskDecisionStates(): Promise<TaskDecisionState[]> {
+    return (await this.store.listSuggestions()).map((task) => ({
+      id: task.id,
+      status: task.status,
+      reviewDecision: task.reviewDecision,
+      reviewedAt: task.reviewedAt,
+      completedAt: task.completedAt ?? null,
+      sourceId: task.sourceId,
+      sourceType: task.sourceType,
+      actionKey: task.actionKey,
+      title: task.title,
+      project: task.project,
+      sourceUrl: task.sourceUrl,
+      scheduledFor: task.scheduledFor,
+    }));
+  }
+
   async scanGmailBacklog(): Promise<{ threadsChecked: number; suggestionsAdded: number; scannedThreads: number; complete: boolean }> {
     const state = await this.store.getGmailBacklogState();
     if (state?.completed) return { threadsChecked: 0, suggestionsAdded: 0, scannedThreads: state.scannedThreads ?? 0, complete: true };
@@ -272,7 +290,9 @@ export class WorkAssistantService {
     for (const health of sources) await this.store.saveSourceHealth(health);
     const tasks = applyKnownPreferences(await this.store.listSuggestions());
     const migratedSourceIds = new Set(tasks.filter((task) => task.migrationSource === "pilot" && task.status !== "review").map((task) => task.sourceId));
-    const ignoredSourceIds = new Set(tasks.filter((task) => task.sourceType === "gmail" && task.status === "ignored").map((task) => task.sourceId));
+    const terminalTasks = tasks.filter((task) => task.sourceType === "gmail" && (task.status === "ignored" || task.status === "done"));
+    const terminalBySource = new Map(terminalTasks.map((task) => [task.sourceId, task]));
+    const terminalByObligation = new Map(terminalTasks.map((task) => [taskObligationKey(task), task]));
     const reviewedActivity = new Map<string, string | null>();
     for (const task of tasks.filter((item) => item.sourceType === "gmail" && item.status !== "review" && item.reviewedAt)) {
       const activity = task.emailLastActivityAt ?? null;
@@ -284,7 +304,9 @@ export class WorkAssistantService {
       .map((task) => `${task.sourceId}:${task.actionKey}`));
     const review = tasks
       .filter((task) => {
-        if (task.status !== "review" || ignoredSourceIds.has(task.sourceId) || migratedSourceIds.has(task.sourceId) || activatedKeys.has(`${task.sourceId}:${task.actionKey}`)) return false;
+        if (task.status !== "review" || migratedSourceIds.has(task.sourceId) || activatedKeys.has(`${task.sourceId}:${task.actionKey}`)) return false;
+        const terminal = terminalBySource.get(task.sourceId) || terminalByObligation.get(taskObligationKey(task));
+        if (terminal && (!task.emailLastActivityAt || !terminal.reviewedAt || task.emailLastActivityAt <= terminal.reviewedAt)) return false;
         const reviewedAtActivity = reviewedActivity.get(task.sourceId);
         return reviewedAtActivity === undefined || Boolean(task.emailLastActivityAt && reviewedAtActivity && task.emailLastActivityAt > reviewedAtActivity);
       })

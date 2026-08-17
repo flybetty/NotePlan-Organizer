@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createRequire } from "node:module";
 import { loadConfig } from "./config.js";
 import { OpenAIEmailClassifier } from "./classifier.js";
 import { TerminalTaskConflictError, type ProjectStatus, type ReviewDecision, type TaskSuggestion } from "./domain.js";
@@ -7,7 +8,9 @@ import { WorkAssistantService } from "./service.js";
 import { FirestoreAssistantStore } from "./store.js";
 
 const config = loadConfig();
-const store = new FirestoreAssistantStore(config.GOOGLE_CLOUD_PROJECT);
+const runtimeRequire = createRequire(import.meta.url);
+const { Firestore } = runtimeRequire("@google-cloud/firestore");
+const store = new FirestoreAssistantStore(new Firestore({ projectId: config.GOOGLE_CLOUD_PROJECT }));
 const google = new GoogleApiGateway(config);
 const classifier = new OpenAIEmailClassifier(config.OPENAI_API_KEY, config.OPENAI_MODEL);
 const service = new WorkAssistantService(config, store, google, classifier);
@@ -66,6 +69,7 @@ const server = createServer(async (request, response) => {
     if (!authorized(request)) return send(response, 401, { error: "Unauthorized" });
     if (url.pathname === "/api/oauth-url" && request.method === "GET") return send(response, 200, { url: google.authorizationUrl() });
     if (url.pathname === "/api/status" && request.method === "GET") return send(response, 200, await service.status());
+    if (url.pathname === "/api/task-state" && request.method === "GET") return send(response, 200, { tasks: await service.taskDecisionStates() });
     if (url.pathname === "/api/today" && request.method === "GET") return send(response, 200, await service.getPlan(url.searchParams.get("date") ?? dateInVancouver()));
     if (url.pathname === "/api/generate" && request.method === "POST") return send(response, 200, await service.generateDailyPlan(url.searchParams.get("date") ?? dateInVancouver(), true));
     if (url.pathname === "/api/gmail/backlog" && request.method === "POST") return send(response, 200, await service.scanGmailBacklog());

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeDueDate } from "../src/classifier.js";
-import { applyReviewDecision, applyTaskUpdate, calculateCapacity, checkInForDate, organizeCarryForward, removeSuggestionFromPlan, stableTaskId, type DailyPlan, type TaskSuggestion } from "../src/domain.js";
+import { applyReviewDecision, applyTaskUpdate, calculateCapacity, checkInForDate, organizeCarryForward, removeSuggestionFromPlan, stableTaskId, taskObligationKey, type DailyPlan, type TaskSuggestion } from "../src/domain.js";
 import { applyKnownPreferences, normalizeProject } from "../src/preferences.js";
 import { isAssistantDigest, isSpamThread, utcDayRangeForTimeZone } from "../src/google.js";
 
@@ -92,6 +92,13 @@ test("rejects impossible calendar dates that JavaScript silently rolls over", ()
 test("stable IDs deduplicate thread actions", () => {
   assert.equal(stableTaskId("abc", "Send Invoice"), stableTaskId("abc", "send invoice"));
   assert.notEqual(stableTaskId("abc", "invoice"), stableTaskId("abc", "testing"));
+});
+
+test("semantic obligation keys survive harmless classifier wording changes", () => {
+  assert.equal(
+    taskObligationKey({ actionKey: "follow-up", title: "Follow up with James", project: "Sparky's" }),
+    taskObligationKey({ actionKey: "follow up", title: "Please follow up with James", project: "Sparky's" }),
+  );
 });
 
 test("preserves unlimited unfinished tasks and Friday history", () => {

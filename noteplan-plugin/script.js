@@ -11,7 +11,7 @@ const NATIVE_TASK_INDEX_FILENAME = "native-task-index.json";
 const MIGRATION_STATE_FILENAME = "migration-state.json";
 const NATIVE_TASK_HEADING = "## Work Activation Tasks";
 const DASHBOARD_WINDOW_ID = "work-activation-dashboard";
-const PLUGIN_VERSION = "0.19.1";
+const PLUGIN_VERSION = "0.20.0";
 
 function settings(required = true) {
   const value = DataStore.settings || {};
@@ -96,6 +96,18 @@ function hash(text) {
   return (value >>> 0).toString(36);
 }
 
+function taskObligationKey(task) {
+  const normalize = (value) => String(value || "").toLowerCase().normalize("NFKD").replace(/[^a-z0-9]+/g, " ").trim();
+  const genericActions = new Set(["action", "follow up", "reply", "task", "work"]);
+  const action = normalize(task.actionKey);
+  const title = normalize(task.title)
+    .replace(/^(please )?(check|email|follow up with|follow up|reply to|send|update)\s+/, "")
+    .replace(/\b(the|a|an|please|client|email)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return `${normalize(task.project)}|${genericActions.has(action) ? title : action || title}`;
+}
+
 function loadNativeTaskIndex() {
   return DataStore.loadJSON(NATIVE_TASK_INDEX_FILENAME) || { version: 1, tasks: {}, legacyMigrated: false };
 }
@@ -132,9 +144,10 @@ function nativeTaskLine(task, start = null, end = null, blockId = nativeBlockId(
 }
 
 function nativeTaskDetails(line) {
-  const block = String(line || "").match(/\^([A-Za-z0-9_-]+)\s*$/);
-  if (!block || !String(line).includes("#assistant/work")) return null;
-  const cleaned = String(line).replace(/^\s*[-*]\s*(?:\[[ xX-]\]\s*)?/, "").trim();
+  const value = String(line || "");
+  const block = value.match(/\^([A-Za-z0-9_-]+)(?=\s|$)/);
+  if (!block || !value.includes("#assistant/work")) return null;
+  const cleaned = value.replace(/^\s*[-*]\s*(?:\[[ xX-]\]\s*)?/, "").trim();
   const time = cleaned.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(AM|PM)\s+/i);
   const toMinutes = (hour, minute, suffix) => (Number(hour) % 12) * 60 + Number(minute) + (suffix.toUpperCase() === "PM" ? 720 : 0);
   const start = time ? toMinutes(time[1], time[2], time[3]) : null;
@@ -142,11 +155,12 @@ function nativeTaskDetails(line) {
   const title = cleaned
     .replace(time?.[0] || "", "")
     .replace(/\s*\[email\]\([^)]+\)/, "")
-    .replace(/\s+#assistant\/work\s+\^[A-Za-z0-9_-]+\s*$/, "")
+    .replace(/\s+#assistant\/work\s+\^[A-Za-z0-9_-]+(?:\s+>\d{4}-\d{2}-\d{2})?\s*$/, "")
     .trim();
   const sourceUrl = cleaned.match(/\[email\]\(([^)]+)\)/)?.[1] || null;
-  const completed = /^\s*[-*]\s*\[[xX]\]/.test(String(line));
-  return { blockId: block[1], start, end, title, sourceUrl, completed };
+  const completed = /^\s*[-*]\s*\[[xX]\]/.test(value);
+  const scheduledDate = value.match(/\s>(\d{4}-\d{2}-\d{2})(?=\s|$)/)?.[1] || null;
+  return { blockId: block[1], start, end, title, sourceUrl, completed, scheduledDate };
 }
 
 function completedParagraphType(type) {
@@ -161,7 +175,11 @@ function findNativeTask(taskId) {
   const candidates = [...new Set([direct, ...(DataStore.calendarNotes || [])].filter(Boolean))];
   for (const note of candidates) {
     const lineIndex = noteLines(note).findIndex((line) => line.includes(`^${entry.blockId}`));
-    if (lineIndex >= 0) return { taskId, entry, note, lineIndex, line: noteLines(note)[lineIndex], date: noteDate(note), type: paragraphTypeForBlock(note, entry.blockId) };
+    if (lineIndex >= 0) {
+      const line = noteLines(note)[lineIndex];
+      const details = nativeTaskDetails(line);
+      return { taskId, entry, note, lineIndex, line, date: details?.scheduledDate || noteDate(note), originDate: noteDate(note), type: paragraphTypeForBlock(note, entry.blockId) };
+    }
   }
   return null;
 }
@@ -174,6 +192,17 @@ function removeNativeTaskLine(found) {
   const lines = noteLines(found.note);
   lines.splice(found.lineIndex, 1);
   setNoteLines(found.note, lines);
+}
+
+function deleteNativeTask(taskId) {
+  const found = findNativeTask(taskId);
+  if (found) removeNativeTaskLine(found);
+  const index = loadNativeTaskIndex();
+  if (index.tasks?.[taskId]) {
+    delete index.tasks[taskId];
+    saveNativeTaskIndex(index);
+  }
+  return Boolean(found);
 }
 
 function appendNativeTaskLine(note, line) {
@@ -207,6 +236,7 @@ function upsertNativeTask(task, targetDate, start = null, end = null) {
     status: task.status || existing?.entry?.status || "today",
     done: Boolean(task.done),
     sourceUrl: task.sourceUrl || existing?.entry?.sourceUrl || null,
+    sourceType: task.sourceType || existing?.entry?.sourceType || "gmail",
     project: task.project || existing?.entry?.project || null,
     returnedFromWaiting: Boolean(task.returnedFromWaiting || existing?.entry?.returnedFromWaiting),
   };
@@ -308,7 +338,7 @@ function migrateNativeBlockIds() {
     let blockId = nativeBlockId(taskId, salt);
     while (occupied.has(blockId)) blockId = nativeBlockId(taskId, salt += 1);
     const lines = noteLines(found.note);
-    lines[found.lineIndex] = lines[found.lineIndex].replace(new RegExp(`\\^${String(entry.blockId).replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\s*$`), `^${blockId}`);
+    lines[found.lineIndex] = lines[found.lineIndex].replace(new RegExp(`\\^${String(entry.blockId).replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}(?=\\s|$)`), `^${blockId}`);
     setNoteLines(found.note, lines);
     entry.blockId = blockId;
     occupied.add(blockId);
@@ -316,6 +346,45 @@ function migrateNativeBlockIds() {
   }
   if (migrated) saveNativeTaskIndex(index);
   return migrated;
+}
+
+function deduplicateNativeTaskOccurrences() {
+  const index = loadNativeTaskIndex();
+  const notes = DataStore.calendarNotes || [];
+  let removed = 0;
+  for (const [taskId, entry] of Object.entries(index.tasks || {})) {
+    const occurrences = [];
+    for (const note of notes) {
+      noteLines(note).forEach((line, lineIndex) => {
+        if (!line.includes(`^${entry.blockId}`)) return;
+        const details = nativeTaskDetails(line);
+        if (!details) return;
+        occurrences.push({ note, line, lineIndex, details, originDate: noteDate(note), effectiveDate: details.scheduledDate || noteDate(note), type: paragraphTypeForBlock(note, entry.blockId) });
+      });
+    }
+    if (occurrences.length <= 1) continue;
+    const completed = occurrences.filter((item) => item.details.completed || completedParagraphType(item.type));
+    const candidates = completed.length ? completed : occurrences;
+    const keep = [...candidates].sort((left, right) => String(right.effectiveDate || "").localeCompare(String(left.effectiveDate || "")) || right.lineIndex - left.lineIndex)[0];
+    const removalsByNote = new Map();
+    for (const occurrence of occurrences) {
+      if (occurrence === keep) continue;
+      if (!removalsByNote.has(occurrence.note)) removalsByNote.set(occurrence.note, []);
+      removalsByNote.get(occurrence.note).push(occurrence.lineIndex);
+      removed += 1;
+    }
+    for (const [note, lineIndexes] of removalsByNote) {
+      const lines = noteLines(note);
+      for (const lineIndex of lineIndexes.sort((left, right) => right - left)) lines.splice(lineIndex, 1);
+      setNoteLines(note, lines);
+    }
+    entry.date = keep.effectiveDate;
+    entry.title = keep.details.title;
+    entry.done = completed.length > 0;
+    index.tasks[taskId] = entry;
+  }
+  if (removed) saveNativeTaskIndex(index);
+  return removed;
 }
 
 function migrateLegacyDashboardBlocks(plan) {
@@ -353,11 +422,10 @@ function migrateLegacyDashboardBlocks(plan) {
   return { migrated, skipped, complete };
 }
 
-async function carryForwardNativeTasks(plan, targetDate) {
+async function carryForwardNativeTasks(targetDate) {
   const date = normalizeDate(targetDate);
   if (date !== localDate() || [0, 6].includes(dateAtNoon(date).getDay())) return { moved: 0, warnings: [] };
   const index = loadNativeTaskIndex();
-  const eligible = new Map([...(plan.today || []), ...(plan.scheduled || [])].map((task) => [task.id, task]));
   let moved = 0;
   const warnings = [];
   for (const [taskId, entry] of Object.entries(index.tasks || {})) {
@@ -365,7 +433,14 @@ async function carryForwardNativeTasks(plan, targetDate) {
     const found = findNativeTask(taskId);
     const details = found && nativeTaskDetails(found.line);
     if (!found || !details || details.completed || completedParagraphType(found.type)) continue;
-    const task = eligible.get(taskId) || { id: taskId, title: details.title, project: entry.project || null, sourceUrl: details.sourceUrl || entry.sourceUrl || null, status: entry.status || "today" };
+    if (found.date && found.date >= date) {
+      if (entry.date !== found.date) {
+        entry.date = found.date;
+        saveNativeTaskIndex(index);
+      }
+      continue;
+    }
+    const task = { id: taskId, title: details.title, project: entry.project || null, sourceUrl: details.sourceUrl || entry.sourceUrl || null, status: entry.status || "today" };
     const snapshot = snapshotNativeTask(taskId);
     try {
       upsertNativeTask({ ...task, status: "scheduled" }, date);
@@ -377,6 +452,77 @@ async function carryForwardNativeTasks(plan, targetDate) {
     }
   }
   return { moved, warnings };
+}
+
+function applyTerminalTaskStates(taskStates) {
+  const terminal = (taskStates || []).filter((task) => task.status === "ignored" || task.status === "done" || task.reviewDecision === "ignore" || task.reviewDecision === "complete");
+  const index = loadNativeTaskIndex();
+  let changed = false;
+  for (const task of terminal) {
+    if (!index.tasks?.[task.id]) continue;
+    if (task.status === "ignored" || task.reviewDecision === "ignore") {
+      deleteNativeTask(task.id);
+      changed = true;
+    } else if (!index.tasks[task.id].done) {
+      completeNativeTask(task.id);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function filterPlanByTaskStates(plan, taskStates) {
+  if (!(taskStates || []).length) return plan;
+  const byId = new Map(taskStates.map((task) => [task.id, task]));
+  const terminal = taskStates.filter((task) => task.status === "ignored" || task.status === "done" || task.reviewDecision === "ignore" || task.reviewDecision === "complete");
+  const terminalBySource = new Map(terminal.map((task) => [task.sourceId, task]));
+  const terminalByObligation = new Map(terminal.map((task) => [taskObligationKey(task), task]));
+  const review = (plan.review || []).filter((task) => {
+    const state = byId.get(task.id);
+    if (state && state.status !== "review") return false;
+    const decided = terminalBySource.get(task.sourceId) || terminalByObligation.get(taskObligationKey(task));
+    return !decided || Boolean(task.emailLastActivityAt && decided.reviewedAt && task.emailLastActivityAt > decided.reviewedAt);
+  });
+  const waiting = (plan.waiting || []).filter((task) => !byId.has(task.id) || byId.get(task.id).status === "waiting");
+  return { ...plan, review, waiting };
+}
+
+function nativeTaskCollections(selectedDate) {
+  const index = loadNativeTaskIndex();
+  const today = [];
+  const later = [];
+  const focusBlocks = [];
+  const warnings = [];
+  for (const [taskId, entry] of Object.entries(index.tasks || {})) {
+    const found = findNativeTask(taskId);
+    if (!found) {
+      if (!entry.done) warnings.push(`A managed task is missing from NotePlan: ${entry.title || taskId}.`);
+      continue;
+    }
+    const details = nativeTaskDetails(found.line);
+    if (!details) {
+      warnings.push(`A managed NotePlan task could not be read: ${entry.title || taskId}.`);
+      continue;
+    }
+    if (details.completed || completedParagraphType(found.type) || entry.done) continue;
+    const task = {
+      id: taskId,
+      title: details.title,
+      project: entry.project || null,
+      sourceUrl: details.sourceUrl || entry.sourceUrl || null,
+      sourceType: entry.sourceType || "gmail",
+      status: "scheduled",
+      scheduledFor: found.date,
+      returnedFromWaiting: Boolean(entry.returnedFromWaiting),
+    };
+    if (found.date === selectedDate && details.start !== null && details.end !== null) {
+      focusBlocks.push({ id: `native-${details.blockId}`, taskId, start: details.start, end: details.end, returnedFromWaiting: task.returnedFromWaiting, task });
+    } else if (found.date === selectedDate) today.push({ ...task, status: "today" });
+    else if (found.date && found.date > selectedDate) later.push(task);
+  }
+  focusBlocks.sort((left, right) => left.start - right.start);
+  later.sort((left, right) => String(left.scheduledFor).localeCompare(String(right.scheduledFor)) || left.title.localeCompare(right.title));
+  return { today, later, focusBlocks, warnings };
 }
 
 async function reconcileNativeTasks() {
@@ -582,7 +728,7 @@ function nativeTaskUrl(taskId) {
   const found = findNativeTask(taskId);
   if (!found) return commandUrl("Assistant: Dashboard");
   const start = Math.max(0, String(found.note.content || "").indexOf(found.line));
-  return `noteplan://x-callback-url/openNote?noteDate=${compactDate(found.date)}&highlightStart=${start}&highlightLength=${found.line.length}`;
+  return `noteplan://x-callback-url/openNote?noteDate=${compactDate(found.originDate || found.date)}&highlightStart=${start}&highlightLength=${found.line.length}`;
 }
 
 function scheduledDashboardTask(task) {
@@ -601,9 +747,19 @@ function waitingDashboardSection(items) {
 }
 
 function reviewDashboardSection(items, selectedDate = localDate()) {
-  const suggestions = suggestedReviewGroups(items);
+  const cutoff = new Date(`${selectedDate}T12:00:00`);
+  cutoff.setDate(cutoff.getDate() - 21);
+  const recent = items.filter((task) => {
+    const date = new Date(task.emailReceivedAt || task.emailLastActivityAt || 0);
+    return !Number.isNaN(date.getTime()) && date >= cutoff;
+  });
+  const backlog = items.filter((task) => !recent.includes(task));
+  const visible = recent.length ? recent : items.slice(0, 8);
+  const hiddenBacklog = recent.length ? backlog : items.slice(8);
+  const suggestions = suggestedReviewGroups(visible);
   const suggested = suggestions.length ? `<style>.suggested-groups{margin:10px 0;padding:11px;border:1px solid #d8cde2;border-radius:11px;background:#f5f0f8}.suggested-groups strong,.suggested-groups small{display:block}.suggested-groups small{margin:3px 0 8px;color:#6d6672;font-size:11px}.suggested-groups div{display:flex;gap:6px;flex-wrap:wrap}.suggested-groups button{border:1px solid #c9b6d7;border-radius:999px;background:#fff;color:#674c78;padding:7px 10px;font-size:11px;font-weight:800;cursor:pointer}.suggested-groups button:hover{background:#e9dff0}</style><div class="suggested-groups"><strong>Suggested related work</strong><small>Choose a group to schedule its email actions as one editable task.</small><div>${suggestions.map((group) => `<button type="button" data-suggested-group data-task-ids="${escapeHtml(JSON.stringify(group.ids))}">${escapeHtml(group.label)} · ${group.ids.length}</button>`).join("")}</div></div>` : "";
-  return `<section class="panel review-panel"><div class="panel-head"><h2>Email Task Review</h2><span>${items.length}</span></div><p class="section-help">Drag ⠿ into the pinned schedule, choose an action, or combine related items into one task.</p>${suggested}<div class="group-toolbar"><button id="group-schedule" type="button" disabled>Group & Schedule</button><small id="group-count">Select at least 2 items</small></div><div class="review-list">${items.length ? items.map((task) => reviewDashboardTask(task, selectedDate)).join("") : '<p class="empty">Every discovered email action has been reviewed.</p>'}</div></section>`;
+  const backlogHtml = hiddenBacklog.length ? `<details class="email-backlog"><summary>Older Email Backlog · ${hiddenBacklog.length}</summary><p class="section-help">Older unresolved email is kept separate so it does not overwhelm today’s review.</p>${hiddenBacklog.map((task) => reviewDashboardTask(task, selectedDate)).join("")}</details>` : "";
+  return `<section class="panel review-panel"><div class="panel-head"><h2>Email Task Review</h2><span>${items.length}</span></div><p class="section-help">Newest email actions are shown first. Drag ⠿ into the pinned schedule, choose an action, or combine related items into one task.</p>${suggested}<div class="group-toolbar"><button id="group-schedule" type="button" disabled>Group & Schedule</button><small id="group-count">Select at least 2 items</small></div><div class="review-list">${items.length ? visible.map((task) => reviewDashboardTask(task, selectedDate)).join("") + backlogHtml : '<p class="empty">Every discovered email action has been reviewed.</p>'}</div></section>`;
 }
 
 function projectsDashboardSection(projects) {
@@ -624,7 +780,7 @@ function ideasDashboardSection(ideas) {
 }
 
 function scheduledDashboardSection(items) {
-  return `<section class="panel"><div class="panel-head"><h2>Scheduled / Needs Date</h2><span>${items.length}</span></div>${items.length ? items.map(scheduledDashboardTask).join("") : '<p class="empty">No scheduled tasks.</p>'}</section>`;
+  return `<section class="panel"><div class="panel-head"><h2>Later</h2><span>${items.length}</span></div>${items.length ? items.map(scheduledDashboardTask).join("") : '<p class="empty">Nothing is scheduled for a later workday.</p>'}</section>`;
 }
 
 function minuteOfDay(value) {
@@ -706,7 +862,7 @@ function availableGaps(events, startMinute = 540) {
 }
 
 function nextOpenTaskSlot(targetDate, events, duration) {
-  const ranges = [...mergeBusyRanges(events), ...nativeBlocksForDate(targetDate).map((block) => ({ start: block.start, end: block.end }))]
+  const ranges = [...mergeBusyRanges(events), ...nativeTaskCollections(targetDate).focusBlocks.map((block) => ({ start: block.start, end: block.end }))]
     .sort((first, second) => first.start - second.start)
     .reduce((merged, range) => {
       const previous = merged.at(-1);
@@ -1273,22 +1429,35 @@ async function savedPlanForDate(selectedDate) {
 async function currentPlan(targetDate = localDate()) {
   const selectedDate = normalizeDate(targetDate);
   let plan;
+  let taskStates = [];
   if (serviceConfigured()) {
     await migratePilotReview();
     plan = await savedPlanForDate(selectedDate);
     const projectResult = await request("/api/projects");
     plan.projects = projectResult.projects || [];
+    try {
+      const taskStateResult = await request("/api/task-state");
+      taskStates = taskStateResult.tasks || [];
+    } catch (error) {
+      taskStates = [];
+      plan.warnings = [...(plan.warnings || []), `Task decisions could not be verified: ${error.message}`];
+    }
   } else {
     const pilot = loadPilotReview();
     if (!pilot) throw new Error("Import the completed pilot review first.");
     plan = pilotPlanFromTransfer(pilot, collectOpenTasks(), selectedDate);
   }
+  plan = filterPlanByTaskStates(plan, taskStates);
   migrateNativeBlockIds();
+  const duplicateCount = deduplicateNativeTaskOccurrences();
+  applyTerminalTaskStates(taskStates);
   const migration = migrateLegacyDashboardBlocks(plan);
+  applyTerminalTaskStates(taskStates);
   const reconciliation = await reconcileNativeTasks();
-  const carry = await carryForwardNativeTasks(plan, selectedDate);
+  const carry = await carryForwardNativeTasks(selectedDate);
   if (serviceConfigured() && (reconciliation.changed || carry.moved)) {
     plan = await savedPlanForDate(selectedDate);
+    plan = filterPlanByTaskStates(plan, taskStates);
     const projectResult = await request("/api/projects");
     plan.projects = projectResult.projects || [];
   }
@@ -1297,20 +1466,20 @@ async function currentPlan(targetDate = localDate()) {
   const startMinute = planningStartMinute(selectedDate);
   const gaps = availableGaps(calendarEvents, startMinute);
   const remainingMinutes = gaps.reduce((total, gap) => total + gap.end - gap.start, 0);
-  const focusBlocks = nativeBlocksForDate(selectedDate);
+  const nativeState = nativeTaskCollections(selectedDate);
+  const focusBlocks = nativeState.focusBlocks;
   const returnedElsewhere = new Set([...returnedPlacement.placements].filter(([, placement]) => placement.date !== selectedDate).map(([taskId]) => taskId));
-  const completedTaskIds = new Set(Object.entries(loadNativeTaskIndex().tasks || {}).filter(([, entry]) => entry.done).map(([taskId]) => taskId));
-  const blockedTaskIds = new Set(focusBlocks.map((block) => block.taskId || block.task?.id).filter(Boolean));
-  const unblockedToday = (plan.today || []).filter((task) => !blockedTaskIds.has(task.id) && !completedTaskIds.has(task.id) && !returnedElsewhere.has(task.id));
-  const unblockedScheduled = (plan.scheduled || []).filter((task) => !blockedTaskIds.has(task.id) && !completedTaskIds.has(task.id));
+  const unblockedToday = nativeState.today.filter((task) => !returnedElsewhere.has(task.id));
+  const unblockedScheduled = nativeState.later;
   plan.ideas = (plan.ideas || []).map((idea) => ({
     ...idea,
     nextQuestion: nextIdeaQuestion(idea.answers?.length || 0),
     nextAction: idea.answers?.length >= 5 ? idea.answers.at(-1)?.answer || null : null,
   }));
   if (!migration.complete) plan.warnings = [...(plan.warnings || []), "Some legacy dashboard blocks could not yet be moved into native NotePlan tasks."];
+  if (duplicateCount) plan.warnings = [...(plan.warnings || []), `${duplicateCount} duplicate native task placement${duplicateCount === 1 ? " was" : "s were"} removed.`];
   const placementMessages = [...returnedPlacement.placements].map(([, placement]) => `↩ A waiting reply was scheduled for ${placement.date} at ${timeLabel(placement.start)}.`);
-  plan.warnings = [...(plan.warnings || []), ...reconciliation.warnings, ...carry.warnings, ...returnedPlacement.warnings, ...placementMessages];
+  plan.warnings = [...(plan.warnings || []), ...nativeState.warnings, ...reconciliation.warnings, ...carry.warnings, ...returnedPlacement.warnings, ...placementMessages];
   const isLateDay = startMinute >= 960;
   const nextInstruction = remainingMinutes < 25
     ? selectedDate === localDate() ? `No workable focus block remains today. Keep unfinished work for ${nextWorkdayLabel(selectedDate)} and do a short shutdown review.` : "No workable focus block is available on this selected date."
@@ -1324,6 +1493,7 @@ async function currentPlan(targetDate = localDate()) {
     today: unblockedToday,
     scheduled: unblockedScheduled,
     focusBlocks,
+    startHere: focusBlocks[0]?.task || unblockedToday[0] || null,
     hasExistingFocusBlocks: focusBlocks.length > 0,
     availableMinutes: remainingMinutes,
     planningStartMinute: startMinute,
@@ -1414,6 +1584,7 @@ async function handleMessageFromHTMLView(actionType, data) {
       if (data.decision === "addToday") restoreNativeTask(data.id, snapshot);
       throw error;
     }
+    if (data.decision === "ignore") deleteNativeTask(data.id);
     await assistantDashboard(selectedDate);
     return;
   }
@@ -1561,7 +1732,7 @@ async function onMessageFromHTMLView(actionType, data) {
 async function assistantApplyDashboardAction(payload = "") {
   try {
     const parsed = JSON.parse(String(payload || ""));
-    const allowed = ["scheduleTask", "groupSchedule", "waitingTask", "saveFocusBlock", "completeTask", "updateTask", "projectStatus", "saveDashboardFeedback", "answerIdea"];
+    const allowed = ["scheduleTask", "groupSchedule", "waitingTask", "saveFocusBlock", "completeTask", "updateTask", "projectStatus", "saveDashboardFeedback", "answerIdea", "reviewTask"];
     if (!allowed.includes(parsed?.type) || !parsed?.data || typeof parsed.data !== "object") throw new Error("Invalid dashboard action.");
     return await handleMessageFromHTMLView(parsed.type, parsed.data);
   } catch (error) {

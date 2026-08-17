@@ -100,6 +100,16 @@ test("email review is ordered by most recently received", async () => {
   assert.deepEqual(plan.review.map((task) => task.id), ["newer", "older"]);
 });
 
+test("confirmed active projects remain visible with no current cloud tasks", async () => {
+  const store = new MemoryAssistantStore();
+  await store.setProjectStatus("The Circle Education", "active");
+  const service = new WorkAssistantService(config, store, new FakeGoogle(), new FakeClassifier());
+  const projects = await service.listProjects();
+  assert.deepEqual(projects.map((project) => ({ name: project.name, status: project.status, count: project.openTaskCount })), [
+    { name: "The Circle Education", status: "active", count: 0 },
+  ]);
+});
+
 test("existing unreviewed Gmail items absent from non-spam results are removed", async () => {
   const store = new MemoryAssistantStore();
   await store.upsertSuggestions([{ ...suggestion, id: "spam", sourceId: "spam-thread" }]);
@@ -161,6 +171,26 @@ test("ignored Gmail threads stay ignored when reclassification changes the actio
   await store.reconcileGmailSuggestions([suggestion.sourceId], [reclassified]);
   assert.equal((await store.getSuggestion(suggestion.id))?.status, "ignored");
   assert.equal(await store.getSuggestion(reclassified.id), null);
+});
+
+test("ignored obligations from old email do not return from another old thread", async () => {
+  const store = new MemoryAssistantStore();
+  const ignored = { ...suggestion, project: "Sparky's", actionKey: "follow-up", title: "Follow up with James", emailLastActivityAt: "2026-08-06T15:00:00Z" };
+  await store.upsertSuggestions([ignored]);
+  await store.reviewSuggestion(ignored.id, "ignore", { scheduledFor: null, waitingOn: null, followUpDate: null }, "2026-08-07T16:00:00Z");
+  const duplicate = { ...ignored, id: "gmail-another-thread-follow-up", sourceId: "another-thread", actionKey: "follow up", title: "Please follow up with James", emailLastActivityAt: "2026-08-06T18:00:00Z" };
+  await store.reconcileGmailSuggestions([duplicate.sourceId], [duplicate]);
+  assert.equal(await store.getSuggestion(duplicate.id), null);
+});
+
+test("a genuinely new matching obligation can return for review", async () => {
+  const store = new MemoryAssistantStore();
+  const ignored = { ...suggestion, project: "Sparky's", actionKey: "follow-up", title: "Follow up with James", emailLastActivityAt: "2026-08-06T15:00:00Z" };
+  await store.upsertSuggestions([ignored]);
+  await store.reviewSuggestion(ignored.id, "ignore", { scheduledFor: null, waitingOn: null, followUpDate: null }, "2026-08-07T16:00:00Z");
+  const newer = { ...ignored, id: "gmail-new-thread-follow-up", sourceId: "new-thread", actionKey: "follow up", title: "Please follow up with James", emailLastActivityAt: "2026-08-10T18:00:00Z" };
+  await store.reconcileGmailSuggestions([newer.sourceId], [newer]);
+  assert.equal((await store.getSuggestion(newer.id))?.status, "review");
 });
 
 test("scheduled Gmail tasks disappear even when refresh changes the action ID", async () => {

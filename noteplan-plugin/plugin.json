@@ -5,7 +5,7 @@
   "plugin.name": "Work Activation Assistant",
   "plugin.description": "Review email-derived tasks, plan selected workdays, preserve unfinished work, and update NotePlan without overwriting manual changes.",
   "plugin.author": "Leslee Hyman",
-  "plugin.version": "0.19.1",
+  "plugin.version": "0.20.0",
   "plugin.releaseStatus": "beta",
   "plugin.hidden": false,
   "plugin.script": "script.js",

@@ -69,6 +69,21 @@ export interface TaskUpdate {
   waitingResponseReceivedAt?: string;
 }
 
+export interface TaskDecisionState {
+  id: string;
+  status: TaskStatus;
+  reviewDecision: ReviewDecision | null;
+  reviewedAt: string | null;
+  completedAt: string | null;
+  sourceId: string;
+  sourceType: TaskSuggestion["sourceType"];
+  actionKey: string;
+  title: string;
+  project: string | null;
+  sourceUrl: string | null;
+  scheduledFor: string | null;
+}
+
 export interface ProjectSummary {
   id: string;
   name: string;
@@ -152,6 +167,22 @@ const minuteFormatterByTimeZone = new Map<string, Intl.DateTimeFormat>();
 export function stableTaskId(sourceId: string, actionKey: string): string {
   const safeKey = actionKey.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
   return `gmail-${sourceId}-${safeKey || "action"}`;
+}
+
+export function taskObligationKey(task: Pick<TaskSuggestion, "actionKey" | "title" | "project">): string {
+  const normalize = (value: string | null | undefined) => String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  const genericActions = new Set(["action", "follow up", "reply", "task", "work"]);
+  const action = normalize(task.actionKey);
+  const title = normalize(task.title)
+    .replace(/^(please )?(check|email|follow up with|follow up|reply to|send|update)\s+/, "")
+    .replace(/\b(the|a|an|please|client|email)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return `${normalize(task.project)}|${genericActions.has(action) ? title : action || title}`;
 }
 
 function validDate(value: string | null): boolean {
