@@ -24,6 +24,7 @@ export interface GoogleDataGateway {
   hasConnection(): Promise<boolean>;
   readRecentThreads(state: GmailSyncState | null): Promise<GmailReadResult>;
   readBacklogThreads(beforeEpoch: number | null): Promise<GmailBacklogResult>;
+  readThreadsByIds(threadIds: string[]): Promise<EmailThreadInput[]>;
   readCalendar(date: string): Promise<CalendarCommitment[]>;
   applyReviewLabels(threadId: string, decision: ReviewDecision): Promise<void>;
 }
@@ -141,6 +142,10 @@ export function isAssistantDigest(subject: string, from: string, to: string, own
   return /^work plan\b/i.test(subject.trim()) && from.toLowerCase().includes(owner) && to.toLowerCase().includes(owner);
 }
 
+export function isSpamThread(messages: gmail_v1.Schema$Message[]): boolean {
+  return messages.some((message) => (message.labelIds ?? []).includes("SPAM"));
+}
+
 export class GoogleApiGateway implements GoogleDataGateway {
   private readonly tokenStore: GoogleTokenStore;
 
@@ -208,8 +213,8 @@ export class GoogleApiGateway implements GoogleDataGateway {
 
   private async initialThreadIds(gmail: gmail_v1.Gmail): Promise<Set<string>> {
     const queries = [
-      "newer_than:30d in:inbox -category:promotions -category:social -category:forums -label:Assistant/Reviewed",
-      "newer_than:90d in:sent -label:Assistant/Reviewed",
+      "newer_than:30d in:inbox -in:spam -category:promotions -category:social -category:forums -label:Assistant/Reviewed",
+      "newer_than:90d in:sent -in:spam -label:Assistant/Reviewed",
     ];
     const threadIds = new Set<string>();
     for (const query of queries) {
@@ -239,34 +244,42 @@ export class GoogleApiGateway implements GoogleDataGateway {
 
   private async fetchThreads(gmail: gmail_v1.Gmail, threadIds: Set<string>): Promise<EmailThreadInput[]> {
     const threads: EmailThreadInput[] = [];
-    for (const threadId of threadIds) {
-      const response = await gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
-      const messages = response.data.messages ?? [];
-      const latest = messages.at(-1);
-      if (!latest) continue;
-      const sender = header(latest, "From");
-      const subject = header(latest, "Subject");
-      if (isAssistantDigest(subject, sender, header(latest, "To"), this.config.WORK_GMAIL_ACCOUNT)) continue;
-      const content = messages
-        .slice(-THREAD_MESSAGE_LIMIT)
-        .map((message) => {
-          const from = header(message, "From");
-          const to = header(message, "To");
-          const sentAt = new Date(Number(message.internalDate ?? Date.now())).toISOString();
-          const ownerMessage = from.toLowerCase().includes(this.config.WORK_GMAIL_ACCOUNT.toLowerCase());
-          return `[${sentAt}] ${ownerMessage ? "MAILBOX OWNER" : "OTHER PERSON"}\nFrom: ${from}\nTo: ${to}\n${redactSecrets(decodeBody(message))}`;
-        })
-        .join("\n--- message ---\n")
-        .slice(-THREAD_CHARACTER_LIMIT);
-      threads.push({
-        threadId,
-        sender,
-        subject,
-        sentByUser: sender.toLowerCase().includes(this.config.WORK_GMAIL_ACCOUNT.toLowerCase()),
-        latestAt: new Date(Number(latest.internalDate ?? Date.now())).toISOString(),
-        content,
-        sourceUrl: `https://mail.google.com/mail/#all/${threadId}`,
-      });
+    const ids = [...threadIds];
+    for (let index = 0; index < ids.length; index += 10) {
+      const batch = await Promise.all(ids.slice(index, index + 10).map(async (threadId): Promise<EmailThreadInput | null> => {
+        const response = await gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
+        const messages = response.data.messages ?? [];
+        if (isSpamThread(messages)) return null;
+        const latest = messages.at(-1);
+        if (!latest) return null;
+        const ownerAccount = this.config.WORK_GMAIL_ACCOUNT.toLowerCase();
+        const sender = header(latest, "From");
+        const subject = header(latest, "Subject");
+        if (isAssistantDigest(subject, sender, header(latest, "To"), this.config.WORK_GMAIL_ACCOUNT)) return null;
+        const latestReceived = [...messages].reverse().find((message) => !header(message, "From").toLowerCase().includes(ownerAccount));
+        const content = messages
+          .slice(-THREAD_MESSAGE_LIMIT)
+          .map((message) => {
+            const from = header(message, "From");
+            const to = header(message, "To");
+            const sentAt = new Date(Number(message.internalDate ?? Date.now())).toISOString();
+            const ownerMessage = from.toLowerCase().includes(ownerAccount);
+            return `[${sentAt}] ${ownerMessage ? "MAILBOX OWNER" : "OTHER PERSON"}\nFrom: ${from}\nTo: ${to}\n${redactSecrets(decodeBody(message))}`;
+          })
+          .join("\n--- message ---\n")
+          .slice(-THREAD_CHARACTER_LIMIT);
+        return {
+          threadId,
+          sender,
+          subject,
+          sentByUser: sender.toLowerCase().includes(ownerAccount),
+          latestAt: new Date(Number(latest.internalDate ?? Date.now())).toISOString(),
+          latestReceivedAt: latestReceived ? new Date(Number(latestReceived.internalDate ?? Date.now())).toISOString() : null,
+          content,
+          sourceUrl: `https://mail.google.com/mail/#all/${threadId}`,
+        };
+      }));
+      threads.push(...batch.filter((thread): thread is EmailThreadInput => thread !== null));
     }
     return threads;
   }
@@ -299,7 +312,7 @@ export class GoogleApiGateway implements GoogleDataGateway {
     const upperBound = beforeEpoch ?? nowEpoch;
     const lowerBound = nowEpoch - 365 * 24 * 60 * 60;
     if (upperBound <= lowerBound) return { threads: [], nextBeforeEpoch: lowerBound, complete: true };
-    const query = `{in:inbox in:sent} after:${lowerBound} before:${upperBound} -category:promotions -category:social -category:forums -label:Assistant/Reviewed`;
+    const query = `{in:inbox in:sent} after:${lowerBound} before:${upperBound} -in:spam -category:promotions -category:social -category:forums -label:Assistant/Reviewed`;
     const response = await gmail.users.threads.list({ userId: "me", q: query, maxResults: BACKLOG_THREAD_LIMIT });
     const threadIds = new Set((response.data.threads ?? []).map((thread) => thread.id).filter((id): id is string => Boolean(id)));
     const threads = await this.fetchThreads(gmail, threadIds);
@@ -309,6 +322,12 @@ export class GoogleApiGateway implements GoogleDataGateway {
       nextBeforeEpoch: Math.max(oldestEpoch, lowerBound),
       complete: threads.length < BACKLOG_THREAD_LIMIT || oldestEpoch <= lowerBound,
     };
+  }
+
+  async readThreadsByIds(threadIds: string[]): Promise<EmailThreadInput[]> {
+    const auth = await this.authorizedClient();
+    const gmail = google.gmail({ version: "v1", auth });
+    return this.fetchThreads(gmail, new Set(threadIds));
   }
 
   async readCalendar(date: string): Promise<CalendarCommitment[]> {
@@ -354,7 +373,7 @@ export class GoogleApiGateway implements GoogleDataGateway {
       labels.set(name, created.data.id);
       return created.data.id;
     };
-    const names = decision === "waiting" ? ["Assistant/Waiting", "Assistant/Reviewed"] : decision === "ignore" ? ["Assistant/Reviewed"] : ["Assistant/Action", "Assistant/Reviewed"];
+    const names = decision === "waiting" ? ["Assistant/Waiting", "Assistant/Reviewed"] : ["complete", "ignore"].includes(decision) ? ["Assistant/Reviewed"] : ["Assistant/Action", "Assistant/Reviewed"];
     const addLabelIds = await Promise.all(names.map(ensureLabel));
     await gmail.users.threads.modify({ userId: "me", id: threadId, requestBody: { addLabelIds } });
   }

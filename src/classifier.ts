@@ -18,7 +18,7 @@ const classifiedTaskSchema = z.object({
 const resultSchema = z.object({ tasks: z.array(classifiedTaskSchema) });
 
 export interface EmailClassifier {
-  classify(threads: EmailThreadInput[], sourceAccount: string, verifiedAt: string): Promise<TaskSuggestion[]>;
+  classify(threads: EmailThreadInput[], sourceAccount: string, verifiedAt: string, planningContext?: string[]): Promise<TaskSuggestion[]>;
 }
 
 export function normalizeDueDate(value: string | null): string | null {
@@ -35,17 +35,17 @@ export class OpenAIEmailClassifier implements EmailClassifier {
     this.client = new OpenAI({ apiKey });
   }
 
-  async classify(threads: EmailThreadInput[], sourceAccount: string, verifiedAt: string): Promise<TaskSuggestion[]> {
+  async classify(threads: EmailThreadInput[], sourceAccount: string, verifiedAt: string, planningContext: string[] = []): Promise<TaskSuggestion[]> {
     if (!threads.length) return [];
     const suggestions: TaskSuggestion[] = [];
     for (let index = 0; index < threads.length; index += 20) {
       const batch = threads.slice(index, index + 20);
-      suggestions.push(...await this.classifyBatch(batch, sourceAccount, verifiedAt));
+      suggestions.push(...await this.classifyBatch(batch, sourceAccount, verifiedAt, planningContext));
     }
     return suggestions;
   }
 
-  private async classifyBatch(threads: EmailThreadInput[], sourceAccount: string, verifiedAt: string): Promise<TaskSuggestion[]> {
+  private async classifyBatch(threads: EmailThreadInput[], sourceAccount: string, verifiedAt: string, planningContext: string[]): Promise<TaskSuggestion[]> {
     const response = await this.client.responses.create({
       model: this.model,
       reasoning: { effort: "low" },
@@ -53,7 +53,7 @@ export class OpenAIEmailClassifier implements EmailClassifier {
       input: [
         {
           role: "system",
-          content: "Extract every distinct unresolved work action for the mailbox owner. Read the messages chronologically and treat the latest messages as authoritative. Include direct requests, explicit owner commitments, replies needed, deadlines, unpaid or unsent invoices, website work, and sent messages that still need follow-up. Exclude newsletters, promotions, FYI messages, completed work, resolved problems, meetings already represented by calendar events, payment receipts, and requests the latest sender confirms are fixed or no longer needed. Do not invent work from quoted older messages after a newer resolution. Never copy credentials, API keys, passwords, passcodes, or verification codes. Every result is only a review suggestion, never an approved task. Return all distinct unresolved actions in each thread. Use short stable actionKey values that describe the action and remain unchanged when wording changes.",
+          content: `Extract every distinct unresolved work action for the mailbox owner. Read the messages chronologically and treat the latest messages as authoritative. Include direct requests, explicit owner commitments, replies needed, deadlines, unpaid or unsent invoices, website work, and sent messages that still need follow-up. Exclude newsletters, promotions, FYI messages, completed work, resolved problems, meetings already represented by calendar events, payment receipts, and requests the latest sender confirms are fixed or no longer needed. Do not invent work from quoted older messages after a newer resolution. Never copy credentials, API keys, passwords, passcodes, or verification codes. Every result is only a review suggestion, never an approved task. Return all distinct unresolved actions in each thread. Use short stable actionKey values that describe the action and remain unchanged when wording changes.${planningContext.length ? ` Respect these user-supplied planning corrections and blockers as authoritative context: ${JSON.stringify(planningContext.slice(0, 30))}` : ""}`,
         },
         { role: "user", content: JSON.stringify(threads) },
       ],
@@ -110,6 +110,9 @@ export class OpenAIEmailClassifier implements EmailClassifier {
         confidence: task.confidence,
         urgencyReason: task.urgencyReason,
         waitingOn: task.waitingOn,
+        emailReceivedAt: thread.latestReceivedAt,
+        emailLastActivityAt: thread.latestAt,
+        gmailLocationVerifiedAt: verifiedAt,
         verifiedAt,
         reviewedAt: null,
         reviewDecision: null,

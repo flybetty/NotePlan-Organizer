@@ -11,9 +11,11 @@
 ## Review UX
 
 - Every review item is visible in a scrollable list, not truncated to six.
-- Each item supports Today, Schedule, Waiting, Edit, Ignore, and source opening.
+- Each item supports Today, Schedule, Waiting, Completed, Edit, Ignore, and source opening.
 - Schedule requires a valid workday date and 9–5 time.
-- Waiting requires both a dependency and follow-up date.
+- Waiting requires a dependency but does not force a guessed follow-up date.
+- Waiting items remain together in one compact review panel.
+- A new incoming reply reactivates the original task, places it in the next available work block, and marks it with `↩`.
 
 ## Workday UX
 

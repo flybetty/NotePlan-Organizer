@@ -1,5 +1,7 @@
 # Current Project Plan
 
+> The current dashboard-only focus-block architecture is being replaced. See `REQUIREMENTS_BASELINE.md` for the non-regression contract and `NATIVE_NOTEPLAN_REBUILD_PLAN.md` for the architecture and migration plan.
+
 ## Product Boundary
 
 NotePlan is the sole work interface. Gmail and Calendar are read as sources; no digest email or Google Doc is produced.

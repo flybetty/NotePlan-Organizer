@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { loadConfig } from "./config.js";
 import { OpenAIEmailClassifier } from "./classifier.js";
-import type { ProjectStatus, ReviewDecision, TaskSuggestion } from "./domain.js";
+import { TerminalTaskConflictError, type ProjectStatus, type ReviewDecision, type TaskSuggestion } from "./domain.js";
 import { GoogleApiGateway } from "./google.js";
 import { WorkAssistantService } from "./service.js";
 import { FirestoreAssistantStore } from "./store.js";
@@ -69,6 +69,17 @@ const server = createServer(async (request, response) => {
     if (url.pathname === "/api/today" && request.method === "GET") return send(response, 200, await service.getPlan(url.searchParams.get("date") ?? dateInVancouver()));
     if (url.pathname === "/api/generate" && request.method === "POST") return send(response, 200, await service.generateDailyPlan(url.searchParams.get("date") ?? dateInVancouver(), true));
     if (url.pathname === "/api/gmail/backlog" && request.method === "POST") return send(response, 200, await service.scanGmailBacklog());
+    if (url.pathname === "/api/tasks/manual" && request.method === "POST") {
+      const values = await body(request);
+      if (typeof values.title !== "string" || typeof values.date !== "string") return send(response, 400, { error: "Task wording and date are required" });
+      return send(response, 200, await service.captureManualTask(values.title, values.date));
+    }
+    if (url.pathname === "/api/reviews/group" && request.method === "POST") {
+      const values = await body(request);
+      const ids = Array.isArray(values.ids) ? values.ids.filter((id): id is string => typeof id === "string") : [];
+      if (typeof values.id !== "string" || typeof values.title !== "string" || typeof values.scheduledFor !== "string") return send(response, 400, { error: "Group ID, title, and scheduled date are required" });
+      return send(response, 200, await service.groupReviews(ids, values.id, values.title, values.scheduledFor));
+    }
     if (url.pathname.startsWith("/api/reviews/") && url.pathname.endsWith("/correct") && request.method === "POST") {
       const values = await body(request);
       if (typeof values.title !== "string" || !values.title.trim()) return send(response, 400, { error: "Corrected task wording is required" });
@@ -78,7 +89,7 @@ const server = createServer(async (request, response) => {
     if (url.pathname.startsWith("/api/reviews/") && request.method === "POST") {
       const values = await body(request);
       const decision = values.decision as ReviewDecision;
-      if (!["addToday", "schedule", "waiting", "ignore"].includes(decision)) return send(response, 400, { error: "Invalid review decision" });
+      if (!["addToday", "schedule", "waiting", "complete", "ignore"].includes(decision)) return send(response, 400, { error: "Invalid review decision" });
       const result = await service.review(decodeURIComponent(url.pathname.slice("/api/reviews/".length)), decision, {
         scheduledFor: typeof values.scheduledFor === "string" ? values.scheduledFor : null,
         waitingOn: typeof values.waitingOn === "string" ? values.waitingOn : null,
@@ -90,8 +101,11 @@ const server = createServer(async (request, response) => {
       const values = await body(request);
       const title = typeof values.title === "string" ? values.title : undefined;
       const completed = typeof values.completed === "boolean" ? values.completed : undefined;
-      if (title === undefined && completed === undefined) return send(response, 400, { error: "No task change supplied" });
-      return send(response, 200, await service.updateTask(decodeURIComponent(url.pathname.slice("/api/tasks/".length)), { title, completed }));
+      const scheduledFor = typeof values.scheduledFor === "string" ? values.scheduledFor : undefined;
+      const returnedFromWaiting = typeof values.returnedFromWaiting === "boolean" ? values.returnedFromWaiting : undefined;
+      const waitingResponseReceivedAt = typeof values.waitingResponseReceivedAt === "string" ? values.waitingResponseReceivedAt : undefined;
+      if (title === undefined && completed === undefined && scheduledFor === undefined && returnedFromWaiting === undefined && waitingResponseReceivedAt === undefined) return send(response, 400, { error: "No task change supplied" });
+      return send(response, 200, await service.updateTask(decodeURIComponent(url.pathname.slice("/api/tasks/".length)), { title, completed, scheduledFor, returnedFromWaiting, waitingResponseReceivedAt }));
     }
     if (url.pathname === "/api/projects" && request.method === "GET") return send(response, 200, { projects: await service.listProjects() });
     if (url.pathname === "/api/projects" && request.method === "POST") {
@@ -99,6 +113,12 @@ const server = createServer(async (request, response) => {
       const status = values.status as ProjectStatus;
       if (typeof values.name !== "string" || !["active", "later", "inactive"].includes(status)) return send(response, 400, { error: "Valid project name and status are required" });
       return send(response, 200, { projects: await service.setProjectStatus(values.name, status) });
+    }
+    if (url.pathname === "/api/pilot/migrate" && request.method === "POST") {
+      const values = await body(request);
+      const tasks = Array.isArray(values.tasks) ? values.tasks as TaskSuggestion[] : [];
+      const decisions = values.decisions && typeof values.decisions === "object" ? values.decisions as Record<string, string> : {};
+      return send(response, 200, await service.migratePilotReview(tasks, decisions));
     }
     if (url.pathname === "/api/noteplan/sync" && request.method === "POST") {
       const values = await body(request);
@@ -133,6 +153,7 @@ const server = createServer(async (request, response) => {
   } catch (error) {
     console.error(JSON.stringify({ severity: "ERROR", message: (error as Error).message, stack: (error as Error).stack }));
     if (error instanceof InvalidJsonBodyError) return send(response, 400, { error: error.message });
+    if (error instanceof TerminalTaskConflictError) return send(response, 409, { error: error.message });
     return send(response, 500, { error: "Internal server error" });
   }
 });

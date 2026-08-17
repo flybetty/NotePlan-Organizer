@@ -1,12 +1,17 @@
 export type SourceStatus = "connected" | "needs_reconnect" | "error" | "not_configured";
 export type TaskStatus = "review" | "today" | "scheduled" | "waiting" | "ignored" | "done";
-export type ReviewDecision = "addToday" | "schedule" | "waiting" | "ignore";
+export type ReviewDecision = "addToday" | "schedule" | "waiting" | "complete" | "ignore";
 export type ProjectStatus = "active" | "later" | "inactive";
+
+export class TerminalTaskConflictError extends Error {}
 
 export interface ReviewDetails {
   scheduledFor: string | null;
   waitingOn: string | null;
   followUpDate: string | null;
+  waitingSince?: string | null;
+  returnedFromWaiting?: boolean;
+  waitingResponseReceivedAt?: string | null;
 }
 
 export interface SourceHealth {
@@ -31,17 +36,24 @@ export interface TaskSuggestion {
   confidence: number;
   urgencyReason: string | null;
   waitingOn: string | null;
+  emailReceivedAt?: string | null;
+  emailLastActivityAt?: string | null;
+  gmailLocationVerifiedAt?: string;
   verifiedAt: string;
   reviewedAt: string | null;
   reviewDecision: ReviewDecision | null;
   scheduledFor: string | null;
   followUpDate: string | null;
+  waitingSince?: string | null;
+  returnedFromWaiting?: boolean;
+  waitingResponseReceivedAt?: string | null;
   previousDay?: string | null;
   done?: boolean;
   canceled?: boolean;
   rescheduled?: boolean;
   carryCount?: number;
   completedAt?: string | null;
+  migrationSource?: "pilot";
   userCorrection?: {
     previousTitle: string;
     correctedTitle: string;
@@ -52,6 +64,9 @@ export interface TaskSuggestion {
 export interface TaskUpdate {
   title?: string;
   completed?: boolean;
+  scheduledFor?: string;
+  returnedFromWaiting?: boolean;
+  waitingResponseReceivedAt?: string;
 }
 
 export interface ProjectSummary {
@@ -90,6 +105,7 @@ export interface DailyPlan {
     scannedThreads: number;
     lastScanAt: string | null;
   };
+  ideas?: Array<{ id: string; text: string; answers: Array<{ answer: string; createdAt: string }> }>;
   documentUrl?: string;
   documentCreatedAt?: string;
   emailDeliveredAt?: string;
@@ -101,6 +117,7 @@ export interface EmailThreadInput {
   subject: string;
   sentByUser: boolean;
   latestAt: string;
+  latestReceivedAt: string | null;
   content: string;
   sourceUrl: string;
 }
@@ -138,17 +155,32 @@ export function stableTaskId(sourceId: string, actionKey: string): string {
 }
 
 function validDate(value: string | null): boolean {
-  return Boolean(value && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(new Date(`${value}T12:00:00`).getTime()));
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T12:00:00`);
+  if (Number.isNaN(date.getTime())) return false;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}` === value;
 }
 
 export function applyReviewDecision(task: TaskSuggestion, decision: ReviewDecision, details: ReviewDetails, now: string): TaskSuggestion {
+  const terminalDecision = task.status === "ignored" || task.reviewDecision === "ignore"
+    ? "ignore"
+    : task.status === "done" || task.done === true || task.reviewDecision === "complete"
+      ? "complete"
+      : null;
+  if (terminalDecision) {
+    if (decision === terminalDecision) return task;
+    throw new TerminalTaskConflictError(`This task is already ${terminalDecision === "ignore" ? "ignored" : "completed"}. Refresh the dashboard before making another change.`);
+  }
   if (decision === "schedule" && !validDate(details.scheduledFor)) throw new Error("A valid scheduled date is required when scheduling a task");
   if (decision === "waiting" && !details.waitingOn?.trim()) throw new Error("Who or what this task is waiting on is required");
-  if (decision === "waiting" && !validDate(details.followUpDate)) throw new Error("A valid follow-up date is required for a waiting task");
   const statuses: Record<ReviewDecision, TaskStatus> = {
     addToday: "today",
     schedule: "scheduled",
     waiting: "waiting",
+    complete: "done",
     ignore: "ignored",
   };
   return {
@@ -157,8 +189,34 @@ export function applyReviewDecision(task: TaskSuggestion, decision: ReviewDecisi
     reviewDecision: decision,
     reviewedAt: now,
     scheduledFor: decision === "schedule" ? details.scheduledFor : null,
-    waitingOn: decision === "waiting" ? details.waitingOn!.trim() : task.waitingOn,
-    followUpDate: decision === "waiting" ? details.followUpDate : null,
+    waitingOn: decision === "waiting" ? details.waitingOn!.trim() : task.waitingOn ?? null,
+    followUpDate: null,
+    waitingSince: decision === "waiting" ? now : task.waitingSince ?? null,
+    returnedFromWaiting: decision === "waiting" ? false : task.returnedFromWaiting ?? false,
+    waitingResponseReceivedAt: decision === "waiting" ? null : task.waitingResponseReceivedAt ?? null,
+    done: decision === "complete" ? true : task.done ?? false,
+    completedAt: decision === "complete" ? now : task.completedAt ?? null,
+  };
+}
+
+export function applyTaskUpdate(task: TaskSuggestion, update: TaskUpdate, updatedAt: string): TaskSuggestion {
+  const terminal = task.status === "ignored" || task.reviewDecision === "ignore"
+    ? "ignored"
+    : task.status === "done" || task.done === true || task.reviewDecision === "complete"
+      ? "completed"
+      : null;
+  if (terminal) {
+    if (terminal === "completed" && update.completed === true && Object.keys(update).every((key) => key === "completed")) return task;
+    throw new TerminalTaskConflictError(`This task is already ${terminal}. Refresh the dashboard before making another change.`);
+  }
+  const title = update.title?.trim();
+  return {
+    ...task,
+    ...(title ? { title } : {}),
+    ...(update.scheduledFor ? { status: "scheduled" as const, scheduledFor: update.scheduledFor, done: false, completedAt: null } : {}),
+    ...(update.returnedFromWaiting !== undefined ? { returnedFromWaiting: update.returnedFromWaiting } : {}),
+    ...(update.waitingResponseReceivedAt ? { waitingResponseReceivedAt: update.waitingResponseReceivedAt } : {}),
+    ...(update.completed === true ? { status: "done" as const, done: true, completedAt: updatedAt, reviewedAt: updatedAt, reviewDecision: "complete" as const } : {}),
   };
 }
 
@@ -170,6 +228,19 @@ export function organizeCarryForward(tasks: TaskSuggestion[], currentDay: string
       previousDay: currentDay === "Monday" && task.previousDay === "Friday" ? "Friday" : task.previousDay,
       carryCount: (task.carryCount ?? 0) + 1,
     }));
+}
+
+export function removeSuggestionFromPlan(plan: DailyPlan, id: string): DailyPlan {
+  const without = (tasks: TaskSuggestion[] = []) => tasks.filter((task) => task.id !== id);
+  return {
+    ...plan,
+    review: without(plan.review),
+    today: without(plan.today),
+    waiting: without(plan.waiting),
+    scheduled: without(plan.scheduled),
+    other: without(plan.other),
+    startHere: plan.startHere?.id === id ? null : plan.startHere,
+  };
 }
 
 function minuteFormatter(timeZone: string): Intl.DateTimeFormat {
@@ -209,7 +280,7 @@ export function calculateCapacity(events: CalendarCommitment[], workdayStart = 9
         end: Math.min(endOfWork, end + transitionMinutes),
       };
     })
-    .filter((range): range is { start: number; end: number } => Boolean(range) && range.end > range.start)
+    .filter((range): range is { start: number; end: number } => range !== null && range.end > range.start)
     .sort((left, right) => left.start - right.start);
 
   const merged: Array<{ start: number; end: number }> = [];
@@ -222,10 +293,11 @@ export function calculateCapacity(events: CalendarCommitment[], workdayStart = 9
   return Math.max(0, endOfWork - startOfWork - occupied);
 }
 
-export function selectStartHere(today: TaskSuggestion[]): TaskSuggestion | null {
+export function selectStartHere(today: TaskSuggestion[], activeProjects = new Set<string>()): TaskSuggestion | null {
   return [...today].sort((left, right) => {
+    const active = Number(activeProjects.has(right.project ?? "")) - Number(activeProjects.has(left.project ?? ""));
     const due = Number(Boolean(right.dueDate)) - Number(Boolean(left.dueDate));
-    return due || right.confidence - left.confidence;
+    return active || due || right.confidence - left.confidence;
   })[0] ?? null;
 }
 
